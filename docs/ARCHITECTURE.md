@@ -40,9 +40,7 @@ The matcher intentionally splits patterns into filterable and unfilterable
 groups. Rules such as `.*`, `a?`, and case-folded literals
 cannot suppress the rejection fast path of unrelated patterns.
 
-The AC filter reports only whether **any** required literal occurs. It does
-not identify which specific rule matches, so a positive lookup still runs
-the entire filtered NFA/DFA. This favors negative-match workloads and may hurt
+The AC filter outputs candidate machine group masks, not exact pattern IDs; selected groups run their whole NFA/DFA. Sharding may hurt cache locality on positive, high-cardinality inputs. This favors negative-match workloads and may hurt
 high-hit workloads.
 
 ## NFA and lazy DFA
@@ -75,8 +73,7 @@ transition storage, instead of one hash-table entry per distinct rune.
 ## Cache concurrency and capacity
 
 `Set` is safe for concurrent matches. Each call acquires a
-`sync.Pool` scratch object. The machine mutex protects state
-interning, initialization and budget counters. Per-state RW locks protect
+`sync.Pool` scratch object. DFA state interning is divided into 32 locked hash shards, with atomic budgets and cache-generation replacement. Per-state RW locks protect
 cached outgoing edges.
 
 Default limits are 4,096 states and 65,536 transitions across both machines.
@@ -96,8 +93,8 @@ can approach linear time in input runes plus output handling, but uncached NFA
 closures are proportional to explored instruction frontiers and the number
 of pattern starts. DFA state space can be exponential in rule complexity.
 
-Not yet implemented: prefix factoring at compile time, true byte-based memory
-limits, adaptive LRU state eviction, byte-oriented ASCII scan, full Unicode
-equivalence ranges, anchored fast paths, multi-chunk streaming, SIMD and
-match-location/capture extraction. Those are substantial follow-up projects,
+Limited prefix factoring for safe literal patterns and conservative Unicode range equivalence are implemented. Generic regex prefix factoring, strict RSS limits, per-state LRU, streaming across chunks, SIMD and capture extraction remain unimplemented. Those are substantial follow-up projects,
 not features of this release.
+
+
+For the current sharded cache, memoized closure, literal trie and RuleSet streaming design, see [OPTIMIZATIONS.md](OPTIMIZATIONS.md).

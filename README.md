@@ -216,3 +216,22 @@ go test -fuzz '^FuzzRuleSetAgainstRegexp$' -fuzztime=30s .
 ```
 
 Tests cover Go `regexp` differential checks, invalid UTF-8, Unicode, word/line boundaries, duplicate patterns, AND/OR priority, conservative prefilter behavior, tiny-cache fallback, optional cache reset, and concurrent use. CI runs tests with race detection, vet, cross-compilation, and a benchmark smoke test; smoke tests are **not** stable performance measurements.
+
+## Latest engine optimizations
+
+See [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) for a code-level explanation of all eight bottlenecks and the three development stages.
+
+- AC prefilter outputs candidate **machine-group masks**; shard selection is conservative, not exact per-pattern filtering.
+- Start-state epsilon closures are memoized; common prefixes of safe literal patterns share a compiled NFA trie.
+- DFA interning uses 32 hash shards, atomic generation replacement, adaptive sparse/bitset frontiers and conservative Unicode range equivalence.
+- RuleSet aggregates matching pattern IDs as they arrive. `MatchAny` stops when any rule is satisfied; `MatchFirstRule` can stop early only when the highest-priority rule is satisfied.
+- `Options.MaxCacheBytes` limits estimated DFA state/edge reservations, **not** total heap/RSS.
+- `Options.DisableCandidateShards` disables AC-driven splitting, which may help hit-heavy workloads with high-cardinality inputs.
+
+### Optimization benchmarks
+
+```sh
+go test -run '^$' -bench 'BenchmarkCandidateShardsHighCardinality|BenchmarkRuleSetPriorityStreaming|BenchmarkLiteralTrieOracles' -benchmem ./...
+```
+
+**Synthetic measurement (Linux/amd64, Go 1.23.2):** 4,096 anchored hostname regexes and 2,048 varied inputs (50% hits) showed **~2,271 ns/op** with candidate sharding versus **~1,658 ns/op** unfiltered, a measured regression caused by cache partitioning. A separate 1,024-rule repeated anchored-literal test measured **~559 ns/op** for the shared-trie DFA versus **~12,991 ns/op** for an early-exit loop over compiled Go regexes. These different, short, warm-cache benchmarks are not universal performance claims.
