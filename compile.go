@@ -23,6 +23,9 @@ func (m *machine) add(id int, tree *syntax.Regexp) error {
 	if m.tryLiteralTrie(id, tree) {
 		return nil
 	}
+	if used, err := m.addPrefixSuffix(id, tree); used || err != nil {
+		return err
+	}
 	p, err := syntax.Compile(tree)
 	if err != nil {
 		return err

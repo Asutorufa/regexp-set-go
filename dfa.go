@@ -49,7 +49,7 @@ type machine struct {
 	unicodeClasses            int
 
 	startMu    sync.Mutex
-	startCache map[syntax.EmptyOp]*dfaState
+	startCache sync.Map // syntax.EmptyOp -> immutable *dfaState
 	pool       sync.Pool
 }
 
@@ -72,7 +72,6 @@ func newMachine(count, rules, maxStates, maxTransitions int, maxBytes int64, res
 		count: count, ruleCount: rules, maxStates: maxStates,
 		maxTransitions: maxTransitions, maxBytes: maxBytes,
 		resetOnFull: resetOnFull,
-		startCache:  make(map[syntax.EmptyOp]*dfaState),
 		compiled:    make(map[string][]uint32),
 		aliases:     make(map[uint32][]int),
 	}
@@ -300,15 +299,19 @@ func (m *machine) intern(candidate *dfaState) *dfaState {
 		}
 		return candidate
 	}
-	candidate.ready = append([]uint32(nil), candidate.ready...)
-	candidate.matches = append([]int(nil), candidate.matches...)
-	candidate.cached = true
-	candidate.owner = g
+	// Candidate may be backed by a reusable call-local scratch object.
+	// Publish a deep copy: cached states must never alias transient scratch.
+	cached := &dfaState{
+		ready:   append([]uint32(nil), candidate.ready...),
+		matches: append([]int(nil), candidate.matches...),
+		cached:  true,
+		owner:   g,
+	}
 	if shard.states == nil {
 		shard.states = make(map[uint64][]*dfaState)
 	}
-	shard.states[key] = append(shard.states[key], candidate)
-	return candidate
+	shard.states[key] = append(shard.states[key], cached)
+	return cached
 }
 
 func reserve(limit int64, count *atomic.Int64, delta int64) bool {

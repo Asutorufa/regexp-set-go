@@ -14,6 +14,7 @@ type scratch struct {
 	matched           []bool
 	bitset            []uint64
 	touchedWords      []int
+	transient         dfaState // caller-local uncached state, reused after each consumed input rune
 }
 
 // closure seeds each Unicode boundary with its memoized unanchored-start
@@ -36,17 +37,20 @@ func (m *machine) closure(raw []uint32, ctx syntax.EmptyOp, sc *scratch) *dfaSta
 // zero-width assertions, so an anchored start cannot be erroneously reused
 // at a later position.
 func (m *machine) startClosure(ctx syntax.EmptyOp) *dfaState {
+	if found, ok := m.startCache.Load(ctx); ok {
+		return found.(*dfaState)
+	}
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
-	if found := m.startCache[ctx]; found != nil {
-		return found
+	if found, ok := m.startCache.Load(ctx); ok {
+		return found.(*dfaState)
 	}
 	scratch := &scratch{seen: make([]uint32, len(m.inst))}
 	state := m.expand(nil, m.starts, ctx, scratch)
 	state.ready = canonicalReady(state.ready, scratch)
 	sort.Ints(state.matches)
 	state.matches = uniqueInts(state.matches)
-	m.startCache[ctx] = state
+	m.startCache.Store(ctx, state)
 	return state
 }
 
@@ -85,7 +89,11 @@ func (m *machine) expand(raw, starts []uint32, ctx syntax.EmptyOp, sc *scratch) 
 			sc.ready = append(sc.ready, pc)
 		}
 	}
-	return &dfaState{ready: sc.ready, matches: sc.matches}
+	// The active uncached state lives in call-local scratch rather than
+	// allocating one heap object per cache miss. advance consumes its old
+	// frontier before the next closure overwrites this value.
+	sc.transient = dfaState{ready: sc.ready, matches: sc.matches}
+	return &sc.transient
 }
 
 // canonicalReady uses sorting for sparse frontiers and a word-indexed bitset

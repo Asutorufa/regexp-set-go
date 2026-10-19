@@ -63,10 +63,11 @@ URL path, process) are **not** supported natively. An application can compose
 several rules or extend the rule AST explicitly; do not assume that matching
 multiple fields against a concatenated string reproduces field-specific rules.
 
-`MatchFirstRule` still needs to find all matching pattern identities before
-choosing the highest-priority satisfied rule. This preserves priority when a
-low-priority expression matches early in the text but a higher-priority AND
-rule matches only later. It is not an early-stopping ordered regex engine.
+`MatchFirstRule` normally scans enough input to preserve priority: an early
+low-priority match cannot beat a later matching higher-priority AND rule.
+When the conservative AC candidate mask proves that every higher-priority
+rule is impossible, matching **can stop once the earliest still-possible rule
+is satisfied**. This is not arbitrary input-dependent priority reordering.
 
 ## Performance and safety
 

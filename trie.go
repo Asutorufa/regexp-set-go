@@ -1,6 +1,7 @@
 package regexpset
 
 import (
+	"fmt"
 	"regexp/syntax"
 	"sort"
 )
@@ -13,6 +14,7 @@ type literalAnchor struct{ begin, end syntax.EmptyOp }
 type literalNode struct {
 	next    map[rune]*literalNode
 	matches []int
+	tails   []uint32 // entry points for compiled non-literal suffix programs
 }
 
 func literalShape(tree *syntax.Regexp) ([]rune, literalAnchor, bool) {
@@ -45,6 +47,95 @@ func literalShape(tree *syntax.Regexp) ([]rune, literalAnchor, bool) {
 		return nil, anchor, false
 	}
 	return parts[0].Rune, anchor, true
+}
+
+// regexPrefixShape recognizes a mandatory case-sensitive literal at the
+// beginning of a concatenation, optionally preceded by a start assertion.
+// The remainder stays a full regexp/syntax program: only the deterministic
+// prefix is factored, so repeats/alternations/zero-width suffixes keep their
+// standard semantics. Alternations at the top level are not transformed.
+func regexPrefixShape(tree *syntax.Regexp) ([]rune, literalAnchor, *syntax.Regexp, bool) {
+	if tree.Op != syntax.OpConcat || len(tree.Sub) < 2 {
+		return nil, literalAnchor{}, nil, false
+	}
+	sub := tree.Sub
+	anchor := literalAnchor{}
+	switch sub[0].Op {
+	case syntax.OpBeginText:
+		anchor.begin = syntax.EmptyBeginText
+		sub = sub[1:]
+	case syntax.OpBeginLine:
+		anchor.begin = syntax.EmptyBeginLine
+		sub = sub[1:]
+	}
+	if len(sub) < 2 || sub[0].Op != syntax.OpLiteral || sub[0].Flags&syntax.FoldCase != 0 || len(sub[0].Rune) < 2 || len(sub[0].Rune) > 4096 {
+		return nil, anchor, nil, false
+	}
+	var tail *syntax.Regexp
+	if len(sub) == 2 {
+		tail = sub[1]
+	} else {
+		tail = (&syntax.Regexp{Op: syntax.OpConcat, Sub: append([]*syntax.Regexp(nil), sub[1:]...)}).Simplify()
+	}
+	return sub[0].Rune, anchor, tail, true
+}
+
+// addPrefixSuffix shares the leading literal trie but keeps the full suffix
+// Thompson program. The suffix accepts with the original pattern ID.
+func (m *machine) addPrefixSuffix(id int, tree *syntax.Regexp) (bool, error) {
+	prefix, anchor, tail, ok := regexPrefixShape(tree)
+	if !ok {
+		return false, nil
+	}
+	p, err := syntax.Compile(tail.Simplify())
+	if err != nil {
+		return true, err
+	}
+	if uint64(len(m.inst))+uint64(len(p.Inst)) > uint64(^uint32(0)) {
+		return true, fmt.Errorf("combined NFA instruction limit exceeded")
+	}
+	offset := uint32(len(m.inst))
+	matchPCs := make([]uint32, 0, 1)
+	for _, inst := range p.Inst {
+		switch inst.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			inst.Out += offset
+			inst.Arg += offset
+		case syntax.InstCapture, syntax.InstEmptyWidth, syntax.InstNop,
+			syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny,
+			syntax.InstRuneAnyNotNL:
+			inst.Out += offset
+		}
+		m.inst = append(m.inst, inst)
+		if inst.Op == syntax.InstMatch {
+			matchPCs = append(matchPCs, uint32(len(m.matchIDs)))
+			m.matchIDs = append(m.matchIDs, id)
+		} else {
+			m.matchIDs = append(m.matchIDs, -1)
+		}
+	}
+	if m.literalTries == nil {
+		m.literalTries = make(map[literalAnchor]*literalNode)
+	}
+	node := m.literalTries[anchor]
+	if node == nil {
+		node = new(literalNode)
+		m.literalTries[anchor] = node
+	}
+	for _, r := range prefix {
+		if node.next == nil {
+			node.next = make(map[rune]*literalNode)
+		}
+		next := node.next[r]
+		if next == nil {
+			next = new(literalNode)
+			node.next[r] = next
+		}
+		node = next
+	}
+	node.tails = append(node.tails, offset+uint32(p.Start))
+	m.compiled[tree.String()] = matchPCs
+	return true, nil
 }
 
 func (m *machine) tryLiteralTrie(id int, tree *syntax.Regexp) bool {
@@ -83,7 +174,8 @@ func (m *machine) appendTrieInst(inst syntax.Inst, id int) uint32 {
 }
 
 func (m *machine) emitLiteralNode(n *literalNode, end syntax.EmptyOp) uint32 {
-	targets := make([]uint32, 0, len(n.next)+1)
+	targets := make([]uint32, 0, len(n.next)+1+len(n.tails))
+	targets = append(targets, n.tails...)
 	if len(n.matches) > 0 {
 		pc := m.appendTrieInst(syntax.Inst{Op: syntax.InstMatch}, n.matches[0])
 		if len(n.matches) > 1 {
