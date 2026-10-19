@@ -138,7 +138,7 @@ func (s *Set) MatchAny(text string) bool {
 	}
 	sc := s.pool.Get().(*scratch)
 	defer s.pool.Put(sc)
-	state, pos, prev := s.begin(text, sc)
+	state, pos, _ := s.begin(text, sc)
 	if len(state.matches) != 0 {
 		return true
 	}
@@ -153,9 +153,7 @@ func (s *Set) MatchAny(text string) bool {
 		if len(state.matches) != 0 {
 			return true
 		}
-		prev = r
 	}
-	_ = prev
 	return false
 }
 
