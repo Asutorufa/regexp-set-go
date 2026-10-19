@@ -2,13 +2,16 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         go: ['1.23.x', 'stable']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -16,4 +19,26 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: go test -race -count=1 ./...
       - run: go vet ./...
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Cross-compile test executables
+        run: |
+          for target in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            export GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
+            go test -c -o /tmp/regexp-set-test-binary ./...
+          done
+
+  benchmark-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
       - run: go test -run '^$' -bench '^BenchmarkMatch$' -benchtime=100ms -benchmem ./...
