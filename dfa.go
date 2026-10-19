@@ -1,6 +1,7 @@
 package regexpset
 
 import (
+	"container/list"
 	"regexp/syntax"
 	"sort"
 	"sync"
@@ -20,8 +21,8 @@ type internShard struct {
 type cacheGeneration struct {
 	evictMu   sync.RWMutex // eviction coordinates interns and edge publications
 	memberMu  sync.Mutex
-	members   map[*dfaState]struct{} // only when EvictLRU is enabled
-	clock     atomic.Uint64
+	members   map[*dfaState]*list.Element // only when EvictLRU is enabled
+	lru       list.List                   // front is most recently used, back is victim
 	evictions atomic.Int64
 	initial   sync.Map // syntax.EmptyOp -> *dfaState
 	shards    [internShardCount]internShard
@@ -65,14 +66,13 @@ type edgeKey struct {
 }
 
 type dfaState struct {
-	ready    []uint32
-	matches  []int
-	cached   bool
-	owner    *cacheGeneration
-	mu       sync.RWMutex
-	edges    map[edgeKey]*dfaState
-	lastUsed atomic.Uint64
-	evicted  atomic.Bool
+	ready   []uint32
+	matches []int
+	cached  bool
+	owner   *cacheGeneration
+	mu      sync.RWMutex
+	edges   map[edgeKey]*dfaState
+	evicted atomic.Bool
 }
 
 func newMachine(count, rules, maxStates, maxTransitions int, maxBytes int64, resetOnFull, evictLRU bool) *machine {
@@ -317,13 +317,19 @@ func equalState(a, b *dfaState) bool {
 	return true
 }
 
-// touch updates approximate LRU recency without taking a global lock on the
-// hot transition path. Ties are harmless: eviction only affects performance.
+// touch maintains exact LRU order with an O(1) linked-list move. This is an
+// opt-in synchronized hot-path cost. Eviction still requires removing incoming
+// cached transitions, so the COMPLETE eviction is not O(1).
 func (m *machine) touch(state *dfaState) {
 	if !m.evictLRU || !state.cached {
 		return
 	}
-	state.lastUsed.Store(state.owner.clock.Add(1))
+	g := state.owner
+	g.memberMu.Lock()
+	if e := g.members[state]; e != nil {
+		g.lru.MoveToFront(e)
+	}
+	g.memberMu.Unlock()
 }
 
 // intern first attempts a sharded lookup. On cache exhaustion and with opt-in
@@ -364,9 +370,9 @@ func (m *machine) intern(candidate *dfaState) *dfaState {
 			if m.evictLRU {
 				g.memberMu.Lock()
 				if g.members == nil {
-					g.members = make(map[*dfaState]struct{})
+					g.members = make(map[*dfaState]*list.Element)
 				}
-				g.members[cached] = struct{}{}
+				g.members[cached] = g.lru.PushFront(cached)
 				g.memberMu.Unlock()
 			}
 			shard.mu.Unlock()
@@ -404,17 +410,13 @@ func (m *machine) evictOne(g *cacheGeneration) bool {
 		return false
 	}
 	g.memberMu.Lock()
-	var victim *dfaState
-	var oldest uint64 = ^uint64(0)
-	for st := range g.members {
-		if tick := st.lastUsed.Load(); tick < oldest {
-			victim, oldest = st, tick
-		}
-	}
-	if victim == nil {
+	tail := g.lru.Back()
+	if tail == nil {
 		g.memberMu.Unlock()
 		return false
 	}
+	victim := tail.Value.(*dfaState)
+	g.lru.Remove(tail)
 	delete(g.members, victim)
 	victim.evicted.Store(true)
 	others := make([]*dfaState, 0, len(g.members))

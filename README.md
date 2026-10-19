@@ -202,3 +202,58 @@ prefixes, incremental streaming, and nested/field-aware logical expressions.
 Do not interpret the presence of a feature as proof it is faster for all
 workloads. For exact/suffix hostnames, a hash table or reversed-domain trie
 can be simpler and faster than a general regex engine.
+
+## Incremental streaming and field-aware logical rules
+
+The engine now supports incremental matching without concatenating all chunks:
+
+```go
+stream := set.NewStream() // set is a *regexpset.Set
+_, _ = stream.Write([]byte("hello"))
+_, _ = stream.Write([]byte(" world"))
+patternIDs := stream.Finish() // resolves $, \b and split UTF-8 correctly
+_ = patternIDs
+```
+
+Flat `RuleSet` additionally supports `NewStream()`, whose `Finish()` returns
+priority-ordered **rule IDs**, respecting AND/OR across chunk boundaries.
+Stream objects are single-writer and must be finished or closed.
+
+For **nested and field-specific** logic use `CompileFieldRules`:
+
+```go
+rules := []regexpset.FieldRule{{
+    ID: 100,
+    When: regexpset.Expr{Op: regexpset.ExprAnd, Children: []regexpset.Expr{
+        {Field: "host", Pattern: `(?i)example\.org$`},
+        {Op: regexpset.ExprOr, Children: []regexpset.Expr{
+            {Field: "path", Pattern: `^/api`},
+            {Field: "method", Pattern: `^POST$`},
+        }},
+    }},
+}}
+fieldSet, err := regexpset.CompileFieldRules(rules)
+if err != nil { panic(err) }
+id, matched := fieldSet.MatchFirstRule(map[string]string{
+    "host":"api.example.org", "path":"/api/v1", "method":"GET",
+}) // 100, true
+_, _ = id, matched
+```
+
+`ExprNot` is also supported. Missing fields never match a regex, and negation
+follows ordinary Boolean semantics. This layer compiles one shared Set **per
+field**, not per rule; cache budgets apply separately to each field.
+
+For streaming lifetime, examples, operators, Unicode folding behavior,
+correctness tests and benchmarks see [streaming and field-aware rules](docs/STREAMING_FIELDS.md).
+
+### Still out of scope
+
+An O(1) *complete* LRU eviction (including transition cleanup), hand-written
+SIMD multi-pattern kernels, and language-equivalent sharing of *all arbitrary*
+regex prefixes are **not implemented** by this addition. Current `EvictLRU`
+uses a linked list for O(1) recency updates and victim selection, but removing
+incoming/outgoing cached edges still costs O(number of retained edges);
+existing deterministic literal-prefix sharing is not general regex-language
+minimization. The folding-aware Unicode interval optimizer uses an explicit
+compilation work limit and falls back safely for large NFA programs.
