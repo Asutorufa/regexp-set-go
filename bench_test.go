@@ -17,11 +17,11 @@ func benchmarkRules(count int) []string {
 	return patterns
 }
 
-func benchmarkInputs(hit bool) []string {
+func benchmarkInputs(hit bool, count int) []string {
 	input := make([]string, 128)
 	for i := range input {
-		if hit {
-			input[i] = "www.host" + fmt.Sprintf("%05d", (i*1777)%10000) + ".example.com"
+		if hit && i%2 == 0 {
+			input[i] = "www.host" + fmt.Sprintf("%05d", (i*1777)%count) + ".example.com"
 		} else {
 			input[i] = "www.unknown" + strconv.Itoa(i) + ".example.org"
 		}
@@ -45,7 +45,7 @@ func BenchmarkMatch(b *testing.B) {
 			if hit {
 				label = "mixed"
 			}
-			inputs := benchmarkInputs(hit)
+			inputs := benchmarkInputs(hit, count)
 			// Warm caches prior to measuring steady-state matching.
 			for _, str := range inputs {
 				set.MatchAny(str)
