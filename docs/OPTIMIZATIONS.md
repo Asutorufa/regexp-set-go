@@ -28,11 +28,12 @@ performance. The matcher remains pure Go and requires no external packages.
    large set of start-consuming instructions on every cold DFA transition.
 3. **Literal-prefix factoring (trie.go, compile.go).** Identical compiled
    regexp/syntax trees reuse one NFA program and emit all original pattern IDs
-   through aliases. Plain case-sensitive literals, optionally anchored at the
-   start/end of text or line, are factored into shared rune-prefix tries.
-   Anchor kinds are kept separate. General regexes, case-folded literals,
-   non-literal prefixes, alternations and repetitions are **not** subject to
-   generic prefix factoring. The trie is compiled into ordinary NFA
+   through aliases. Pure case-sensitive literals, optionally anchored at the start/end of text
+   or line, are factored into shared rune-prefix tries. Case-sensitive
+   deterministic leading literals followed by **arbitrary regexp suffixes**
+   now share the leading trie while the suffix remains a normal compiled NFA.
+   Anchor kinds are kept separate. Case-folded and ambiguous/alternating
+   leading prefixes are not generically factored. The trie is compiled into ordinary NFA
    instructions, not into a separate runtime matcher.
 
 ### Stage 2: reduce DFA state and cache overhead
@@ -41,7 +42,8 @@ performance. The matcher remains pure Go and requires no external packages.
    independently locked intern tables. Entries are compared by their entire
    sorted NFA frontier and accepted IDs; hash collisions do not change the
    match result. State and transition counters use atomic reservations, not
-   the old single global mutex. Per-state RW locks protect transition maps.
+   the old single global mutex. Uncached states reuse a scratch-owned
+   `dfaState`, while interning creates an immutable deep copy. Per-state RW locks protect transition maps.
 5. **Safe generation recycling (dfa.go).** Cache generations are published
    with an atomic pointer. Reset swaps the pointer and leaves previous
    generations intact, allowing in-flight readers to finish. New edges are
@@ -73,16 +75,17 @@ performance. The matcher remains pure Go and requires no external packages.
    machine visits each distinct matched pattern identity and feeds it into
    the associated rule's hit count without first building and sorting a full
    pattern-ID list. `MatchAny` can stop as soon as *any* rule is satisfied.
-   `MatchFirstRule` can safely stop as soon as the **highest-priority rule**
-   (index zero) is satisfied; otherwise it continues scanning, because a
-   later substring can satisfy an earlier AND rule. `MatchRuleIDs` always
+   `MatchFirstRule` can safely stop as soon as the **earliest rule still possible**
+   under the AC group mask is satisfied; otherwise it continues scanning,
+   because a later substring can satisfy an earlier AND rule. `MatchRuleIDs` always
    returns all satisfied rules sorted by declaration order.
 
 RuleSet does **not** store mutable AND counters in immutable DFA states.
 Those counters depend on the entire input prefix and would make the state
 space explode if included in the DFA identity. Pooled match-local scratch
-stores counters instead. Dynamic "highest remaining possible priority"
-proof and arbitrary nested AND/OR rule ASTs remain future work.
+stores counters instead. The proof is conservative and only excludes rules whose necessary AC
+pattern group is absent. More precise per-pattern candidate filtering and
+nested AND/OR ASTs remain future work.
 
 ## Usage
 
@@ -142,3 +145,32 @@ go test -run '^$' -bench 'BenchmarkCandidateShardsHighCardinality|BenchmarkRuleS
 The differential tests cover literal-prefix sharing, zero-width assertions,
 Unicode classes, invalid UTF-8, candidate sharding, duplicate pattern IDs,
 AND/OR priorities, tiny byte budgets and concurrent cache recycling.
+
+### Satisfied-AND / first-priority comparison
+
+`BenchmarkRuleSetSatisfiedAND` adds a missing case: 512 logical rules with
+three overlapping AND expressions each, and inputs that fully satisfy early,
+middle, or late rules. It compares the same `MatchFirstRule` result to a
+precompiled sequential Go `regexp` loop that **also stops at the first
+satisfied rule**. Illustrative 100ms Linux/amd64 Go 1.23.2 measurements:
+
+| Input | RuleSet first (ns/op) | Early-exit regexp loop (ns/op) |
+| --- | ---: | ---: |
+| First rule satisfies AND | 10,936 | 584 |
+| Middle rule satisfies AND | 10,474 | 4,736 |
+| Last rule satisfies AND | 10,004 | 17,596 |
+| No rule satisfies AND | 710 | 2,200 |
+
+These results are **not** evidence that one matcher universally dominates:
+RuleSet pays the overhead of scanning its combined machines even when the
+first logical AND rule wins, whereas the sequential loop is exceptionally
+cheap when the first rule succeeds. For routing work with a very hot first
+rule, consider a specialized fast path or smaller ordered tiers before the
+shared matcher. For large no-match corpora, prefiltering remains valuable.
+
+This release deliberately does not promise byte-exact Go heap limits or a
+fully adaptive per-state LRU: concurrent snapshots, map bucket overhead and
+old generations awaiting collection mean a precise retained-memory cap would
+require a different cache allocator. `MaxCacheBytes` bounds only the tracked
+cache reservations described above. Prefer explicit semantics to a false
+memory-safety guarantee.

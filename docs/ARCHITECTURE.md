@@ -1,100 +1,68 @@
-# Engine architecture
+# RegexSet architecture (optimized version)
 
-## Correctness and scope
+This describes the **local optimization candidate** built on top of the
+public `regexp-set-go` engine; it retains Go `regexp.Regexp.MatchString`
+existence semantics and the original pattern ID for duplicate expressions.
 
-This is a multi-rule **existence** matcher for Go/RE2 regular expressions, with
-the same `regexp.Regexp.MatchString` semantics for each rule.
-It is not a streaming matcher, a submatch extractor, a priority router or a
-replacement for extended PCRE features.
-
-Invariants:
-
-1. Every pattern retains its original zero-based ID, including duplicates.
-2. The prefilter is conservative: no input can be rejected if a filtered
-   pattern would match it. False positives only cost CPU.
-3. New NFA starts are included at **every Unicode rune boundary**; assertions
-   inspect the previous and next runes using `syntax.EmptyOpContext`.
-4. Interned DFA states own their memory. Match-local uncached states can borrow
-   scratch arrays only until the next transition consumes them.
-5. State edge caches are synchronized. A generation reset does not mutate
-   states already held by concurrent readers.
-6. Cache limits span all machine groups, but count entries, **not bytes**.
-
-## Compilation and dispatch
+## Compile pipeline
 
 ```text
-patterns
-    |
-    +--- regexp/syntax.Parse + Simplify (preserve ID)
-    |
-    +--- conservative mandatory ASCII substring extraction
-            |
-            +--- no required literal --- Thompson NFA + lazy DFA
-            |
-            +--- safe required literal --- sparse AC presence filter
-                                            |
-                                            +--- on possible hit --- NFA + DFA
+regexp/syntax.Parse + Simplify
+  |
+  +--> mandatory ASCII substring analysis
+  |       |
+  |       +--> no necessary literal -> unconditional NFA group
+  |       +--> necessary literal -> AC output identifies candidate *groups*
+  |
+  +--> Thompson NFA emission with duplicate aliases
+  +--> pure literal trie and deterministic literal-prefix / regex-tail trie
+  +--> memoized start epsilon closures, per boundary context
+  +--> ASCII / safe Unicode equivalence classes
+  +--> sharded lazy DFA state interner and bounded transition caches
+
+RuleSet receives streamed pattern IDs -> OR / AND counters -> declared
+priority. It does not create one DFA per logical rule.
 ```
 
-The matcher intentionally splits patterns into filterable and unfilterable
-groups. Rules such as `.*`, `a?`, and case-folded literals
-cannot suppress the rejection fast path of unrelated patterns.
+## Matching invariants
 
-The AC filter outputs candidate machine group masks, not exact pattern IDs; selected groups run their whole NFA/DFA. Sharding may hurt cache locality on positive, high-cardinality inputs. This favors negative-match workloads and may hurt
-high-hit workloads.
+1. A prefilter is a **necessary** test only; it cannot exclude a matching
+   pattern. Candidate masks select machines, not individual dynamic DFA
+   frontiers. This avoids input-specific DFA cache identities.
+2. Each rune boundary implicitly starts new unanchored matches; start
+   epsilon closures are cached by the exact `syntax.EmptyOp` boundary context.
+   Anchored-prefix trie roots check their own beginning assertion.
+3. Prefix factoring is applied only to deterministic, case-sensitive
+   literals in compatible AST positions. Regex suffixes retain their original
+   compiled NFA instructions, including suffix assertion semantics.
+4. A DFA state identity includes sorted consuming PCs and accepted pattern
+   IDs. Collision-safe hashes are checked with full equality.
+5. Unicode interval equivalence is disabled for problematic folding or
+   compiler work bounds; zero-width assertions are independently included
+   in edge keys. UTF-8 malformed sequences follow Go's RuneError decoding.
+6. Uncached DFA state objects borrow a per-call scratch object. Cache inserts
+   publish separately allocated deep copies with no aliases into scratch.
+7. A cache generation switch never mutates old states held by concurrent
+   readers. Intern shards, per-state transition locks and atomic budget
+   reservations are synchronized.
+8. Rule priorities use array order. Lower-priority early matches cannot
+   defeat unresolved higher-priority AND rules. AC candidate-group exclusions
+   can prove that a higher-priority rule is impossible, allowing early return.
 
-## NFA and lazy DFA
+## Complexity and tradeoffs
 
-Every parsed expression is compiled through `regexp/syntax.Compile`,
-with instruction indices translated into one combined instruction array.
-Accepting instructions carry original pattern IDs. Captures become epsilon
-transitions because the API returns rule existence, not submatch spans.
+AC lookup is amortized linear in input bytes; warm DFA transitions are close
+to linear in runes plus output processing. On a cache miss, the engine must
+recompute consuming NFA frontiers and epsilon closures. Shared prefix tries
+and memoized root closures reduce but do not eliminate this cost.
 
-The epsilon closure uses generation-stamped arrays to avoid repeated clearing,
-collects consuming instruction pointers and accepted IDs, then sorts to obtain
-a canonical deterministic frontier.
+DFA state space may still be exponential in NFA program complexity. A
+state-count and an **estimated byte reservation** budget bound retained
+accounted cache entries but **not** RSS or complete Go heap use. Compiled
+programs, AC tries, scratch pools, old GC generations and map overhead are
+outside the budget. Replacing the whole generation is optional, not LRU.
 
-On a transition cache miss, all consuming instructions of the current frontier
-are evaluated against the rune and the result is closed again. A 64-bit
-hash indexes canonical states; equality is checked to handle collisions.
-
-## Equivalence classes
-
-ASCII code points are grouped into equivalence classes when they have exactly
-the same acceptance vector over all consuming NFA instructions.
-`(classID, emptyWidthContext)` is the transition cache key. This
-keeps `\b`, `^`, case-folding and character classes correct
-as the empty-width context is independent of the consuming code point.
-Non-ASCII runes use their actual values, including U+FFFD for malformed UTF-8.
-
-A future optimization is to construct Unicode equivalence ranges and denser
-transition storage, instead of one hash-table entry per distinct rune.
-
-## Cache concurrency and capacity
-
-`Set` is safe for concurrent matches. Each call acquires a
-`sync.Pool` scratch object. DFA state interning is divided into 32 locked hash shards, with atomic budgets and cache-generation replacement. Per-state RW locks protect
-cached outgoing edges.
-
-Default limits are 4,096 states and 65,536 transitions across both machines.
-Upon reaching a limit, **default behavior is correct uncached fallback**.
-`ResetCacheOnFull` is opt-in whole-generation recycling.
-It is not LRU: under tiny budgets, repeated resets can be much slower than
-ordinary fallback, so benchmark it on the intended workload.
-
-These limits do not constrain the compiled NFA size, AC nodes, worker-local
-scratch, maps' memory overhead, or transient allocations. Untrusted patterns
-require independent application-level resource controls.
-
-## Complexity and remaining work
-
-AC presence lookup is amortized linear in input bytes. Warm lazy-DFA matching
-can approach linear time in input runes plus output handling, but uncached NFA
-closures are proportional to explored instruction frontiers and the number
-of pattern starts. DFA state space can be exponential in rule complexity.
-
-Limited prefix factoring for safe literal patterns and conservative Unicode range equivalence are implemented. Generic regex prefix factoring, strict RSS limits, per-state LRU, streaming across chunks, SIMD and capture extraction remain unimplemented. Those are substantial follow-up projects,
-not features of this release.
-
-
-For the current sharded cache, memoized closure, literal trie and RuleSet streaming design, see [OPTIMIZATIONS.md](OPTIMIZATIONS.md).
+Partial optimizations intentionally left conservative: AC only narrows to
+pattern groups; generic arbitrary-prefix automaton factoring, precise
+memory accounting, per-state eviction and complete Unicode casefolding-aware
+classes are substantial remaining work. See `OPTIMIZATIONS.md`.

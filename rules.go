@@ -28,9 +28,10 @@ type Rule struct {
 }
 
 type compiledRule struct {
-	id       uint32
-	operator RuleOperator
-	patterns int
+	id           uint32
+	operator     RuleOperator
+	patterns     int
+	firstPattern int // start of contiguous pattern indexes for this rule
 }
 
 // RuleSet matches all expressions with one underlying RegexSet, then evaluates
@@ -75,7 +76,7 @@ func CompileRulesWithOptions(rules []Rule, options Options) (*RuleSet, error) {
 			return nil, fmt.Errorf("regexpset: rule %d: no patterns", index)
 		}
 		result.rules = append(result.rules, compiledRule{
-			id: rule.ID, operator: rule.Operator, patterns: len(rule.Patterns),
+			id: rule.ID, operator: rule.Operator, patterns: len(rule.Patterns), firstPattern: len(patterns),
 		})
 		for _, pattern := range rule.Patterns {
 			patterns = append(patterns, pattern)
@@ -129,16 +130,29 @@ func (s *RuleSet) MatchAny(input string) bool {
 	return found
 }
 
-// MatchFirstRule returns the highest-priority satisfied rule's ID. Priority is
-// input order, never the numeric value of ID or the order of DFA matches.
+// MatchFirstRule returns the highest-priority satisfied rule. Candidate AC
+// masks make a rule provably impossible when an AND member (or every OR
+// member) belongs to an excluded mandatory-literal shard. As soon as the
+// earliest still-possible rule is complete, no later input can change the
+// winner, so scanning can end without sacrificing priority.
 func (s *RuleSet) MatchFirstRule(input string) (uint32, bool) {
 	if len(s.rules) == 0 {
 		return 0, false
 	}
+	candidates := s.set.candidateMask(input)
 	sc := s.pool.Get().(*ruleScratch)
 	defer s.release(sc)
-	s.countMatchesUntil(sc, input, func(index int) bool {
-		return index == 0 && s.satisfied(0, sc.hits[0])
+	// Defer looking for the earliest viable rule until a rule actually
+	// matches. No-match workloads avoid scanning all logical rules here.
+	earliest := -1
+	s.countMatchesWithMask(sc, input, candidates, func(index int) bool {
+		if !s.satisfied(index, sc.hits[index]) {
+			return false
+		}
+		if earliest == -1 {
+			earliest = s.firstPossibleRule(candidates)
+		}
+		return earliest == index
 	})
 	best := len(s.rules)
 	for _, index := range sc.touched {
@@ -150,6 +164,37 @@ func (s *RuleSet) MatchFirstRule(input string) (uint32, bool) {
 		return 0, false
 	}
 	return s.rules[best].id, true
+}
+
+// rulePossible never declares a matching rule impossible: filtered patterns
+// have a necessary AC substring, while unfiltered patterns are always viable.
+func (s *RuleSet) rulePossible(index int, candidates uint64) bool {
+	rule := s.rules[index]
+	if rule.operator == RuleAND {
+		for p := rule.firstPattern; p < rule.firstPattern+rule.patterns; p++ {
+			mask := s.set.patternGroupBits[p]
+			if mask != 0 && candidates&mask == 0 {
+				return false
+			}
+		}
+		return true
+	}
+	for p := rule.firstPattern; p < rule.firstPattern+rule.patterns; p++ {
+		mask := s.set.patternGroupBits[p]
+		if mask == 0 || candidates&mask != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *RuleSet) firstPossibleRule(candidates uint64) int {
+	for index := range s.rules {
+		if s.rulePossible(index, candidates) {
+			return index
+		}
+	}
+	return len(s.rules)
 }
 
 // MatchRuleIDs returns every satisfied rule ID in priority order (not numeric
@@ -194,7 +239,11 @@ func (s *RuleSet) countMatches(sc *ruleScratch, input string) {
 // existence query we can stop on the first complete rule. For first-priority
 // matching, early exit is safe only when rule index zero is complete.
 func (s *RuleSet) countMatchesUntil(sc *ruleScratch, input string, stop func(int) bool) {
-	s.set.visitMatches(input, func(patternID int) bool {
+	s.countMatchesWithMask(sc, input, s.set.candidateMask(input), stop)
+}
+
+func (s *RuleSet) countMatchesWithMask(sc *ruleScratch, input string, candidates uint64, stop func(int) bool) {
+	s.set.visitWithMask(input, candidates, func(patternID int) bool {
 		index := s.patternToRule[patternID]
 		if sc.hits[index] == 0 {
 			sc.touched = append(sc.touched, index)

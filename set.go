@@ -45,10 +45,11 @@ type CacheStats struct {
 // Set is immutable except for synchronized caches and safe for concurrent use.
 // Each expression is assigned its original zero-based index, even for duplicates.
 type Set struct {
-	count      int
-	groups     []*machine
-	candidates *prefilter
-	groupBits  []uint64 // zero means unconditional, otherwise requires matching AC bucket
+	count            int
+	groups           []*machine
+	candidates       *prefilter
+	groupBits        []uint64 // zero means unconditional, otherwise requires matching AC bucket
+	patternGroupBits []uint64 // one safe necessary candidate bit per pattern (0: unconditional)
 }
 
 // Compile compiles patterns using bounded caches and safe literal prefiltering.
@@ -83,7 +84,7 @@ func CompileWithOptions(patterns []string, opts Options) (*Set, error) {
 			eligible = append(eligible, p)
 		}
 	}
-	result := &Set{count: len(patterns)}
+	result := &Set{count: len(patterns), patternGroupBits: make([]uint64, len(patterns))}
 	var gs []patternGroup
 	if len(regular) > 0 {
 		gs = append(gs, patternGroup{patterns: regular})
@@ -148,6 +149,9 @@ func CompileWithOptions(patterns []string, opts Options) (*Set, error) {
 		}
 		m := newMachine(len(patterns), len(g.patterns), stateBudgets[i], edgeBudgets[i], bytes, opts.ResetCacheOnFull)
 		for _, p := range g.patterns {
+			if g.filter {
+				result.patternGroupBits[p.id] = uint64(1) << uint(i)
+			}
 			if err := m.add(p.id, p.tree); err != nil {
 				return nil, fmt.Errorf("regexpset: pattern %d: %w", p.id, err)
 			}
@@ -240,11 +244,20 @@ func (s *Set) MatchInto(input string, dst []int) []int {
 // visitMatches streams distinct pattern IDs, including across the two
 // optional prefilter/regular partitions. A true callback response stops the
 // scan; ID ordering is intentionally not guaranteed.
-func (s *Set) visitMatches(input string, emit func(int) bool) bool {
-	candidates := ^uint64(0)
+func (s *Set) candidateMask(input string) uint64 {
 	if s.candidates != nil {
-		candidates = s.candidates.candidateGroups(input)
+		return s.candidates.candidateGroups(input)
 	}
+	return ^uint64(0)
+}
+
+func (s *Set) visitMatches(input string, emit func(int) bool) bool {
+	return s.visitWithMask(input, s.candidateMask(input), emit)
+}
+
+// visitWithMask accepts only a precomputed conservative AC mask. All selected
+// machines still verify their patterns with full regular-expression semantics.
+func (s *Set) visitWithMask(input string, candidates uint64, emit func(int) bool) bool {
 	for i, g := range s.groups {
 		if s.groupBits[i] != 0 && candidates&s.groupBits[i] == 0 {
 			continue

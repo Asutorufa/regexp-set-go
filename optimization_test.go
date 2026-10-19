@@ -211,3 +211,107 @@ func TestPlainRegexBehaviorDifferentialWithAliases(t *testing.T) {
 		}
 	}
 }
+
+// An early lower-priority hit is safe only after the AC mask proves the
+// higher-priority AND rule cannot complete anywhere in this input.
+func TestRuleSetCandidatePriorityPruning(t *testing.T) {
+	rules := []Rule{
+		{ID: 100, Operator: RuleAND, Patterns: []string{`^priorityABCDEF`, `suffixXYZ$`}},
+		{ID: 200, Operator: RuleOR, Patterns: []string{`secondaryFOO`}},
+		{ID: 300, Operator: RuleOR, Patterns: []string{`fallbackBAR`}},
+	}
+	for i := 0; i < 900; i++ {
+		rules = append(rules, Rule{ID: uint32(1000 + i), Operator: RuleOR, Patterns: []string{fmt.Sprintf(`^random_%06d\.example$`, i)}})
+	}
+	for _, options := range []Options{{}, {DisableCandidateShards: true}, {DisablePrefilter: true}, {MaxStates: 1, MaxTransitions: 1, MaxCacheBytes: 1}} {
+		set, err := CompileRulesWithOptions(rules, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, input := range []string{
+			"secondaryFOO.....fallbackBAR",
+			"priorityABCDEF_secondaryFOO_suffixXYZ",
+			"priorityABCDEF_suffixXYZ_secondaryFOO",
+			"fallbackBAR", "nothing", "priorityABCDEF", "secondaryFOO", "random_000800.example",
+		} {
+			var want []uint32
+			for _, rule := range rules {
+				matched := rule.Operator == RuleAND
+				for _, pattern := range rule.Patterns {
+					matches := regexp.MustCompile(pattern).MatchString(input)
+					if rule.Operator == RuleAND {
+						matched = matched && matches
+					} else {
+						matched = matched || matches
+					}
+				}
+				if matched {
+					want = append(want, rule.ID)
+				}
+			}
+			got := set.MatchRuleIDs(input)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("opts=%+v input=%q got %v want %v", options, input, got, want)
+			}
+			first, ok := set.MatchFirstRule(input)
+			if ok != (len(want) > 0) || (ok && first != want[0]) {
+				t.Fatalf("opts=%+v input=%q got first=(%d,%v) want=%v", options, input, first, ok, want)
+			}
+		}
+	}
+}
+
+// Verify transient uncached states never overwrite a state retained in a
+// shared DFA cache, even when the cache is tiny and many inputs interleave.
+func TestTransientFallbackOwnership(t *testing.T) {
+	patterns := []string{`^foo(?:bar|baz)\d+$`, `(?m)^hello$`, `\bcat\b`, `.*world`, `foo`, `foo`, `bar|baz`}
+	for _, opt := range []Options{{MaxStates: 1, MaxTransitions: 1}, {MaxStates: 2, MaxTransitions: 2}, {MaxStates: 8, MaxTransitions: 16, ResetCacheOnFull: true}} {
+		set, err := CompileWithOptions(patterns, opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for repeat := 0; repeat < 20; repeat++ {
+			for _, input := range []string{"foobar123", "foobaz123", "foo", "HELLO", "hello\nworld", "cat bar", "baz", "", "hello", "\xfffoo"} {
+				got, want := set.MatchIDs(input), oracle(patterns, input)
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("opts=%+v repeat=%d input=%q got %v want %v", opt, repeat, input, got, want)
+				}
+			}
+		}
+	}
+}
+
+// Prefix factoring may only remove a deterministic literal from the original
+// AST; every remainder must retain regexp/syntax's exact matching semantics.
+func TestGeneralRegexpPrefixFactoring(t *testing.T) {
+	patterns := []string{
+		`^foobar[0-9]+$`, `^foobaz(?:cat|dog)$`, `^foobar[a-z]{2,5}`, `^fooabc\b`,
+		`foobar[0-9]+`, `foobar[0-9]+`, `(?m)^foobar\d+$`, `^foobar$`,
+		`foobar.*baz`, `foobaz.*qux`, `foobar(?:a|b)?`, `foobar\p{Greek}+`,
+		`foo世界.+`, `foo世界$`, `^foo世界.*x$`, `foobar\A`, `foobar\z`,
+		`(?i)foobar[0-9]+`, `(?s)foobar.*qux`, `(foobar)+`, `^foobar\.com$`,
+	}
+	for _, opt := range []Options{{}, {DisablePrefilter: true}, {MaxStates: 1, MaxTransitions: 1}, {MaxCacheBytes: 1}} {
+		s, err := CompileWithOptions(patterns, opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidates := []string{"", "foobar", "foobar5", "foobazcat", "foobazdog", "foobarXY", "foobar10", "foobar2a", "foobarA", "foobar\\n", "foobarqux", "foobar123baz", "foobarabc", "foobarαβ", "foobar.com", "foobardog", "foo世界abc", "foo世界x", "FOOBAR1", "foobar\nx", "foobar\n"}
+		rng := rand.New(rand.NewSource(77))
+		alphabet := []rune("foabrcatdg01239ABC.-_\n世界αβ")
+		for i := 0; i < 400; i++ {
+			length := rng.Intn(36)
+			var b strings.Builder
+			for j := 0; j < length; j++ {
+				b.WriteRune(alphabet[rng.Intn(len(alphabet))])
+			}
+			candidates = append(candidates, b.String())
+		}
+		for _, input := range candidates {
+			got, want := s.MatchIDs(input), oracle(patterns, input)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("opts=%+v input=%q got=%v want=%v", opt, input, got, want)
+			}
+		}
+	}
+}
