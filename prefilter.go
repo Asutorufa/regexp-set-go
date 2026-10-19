@@ -70,23 +70,33 @@ func mandatoryASCII(r *syntax.Regexp) string {
 	return ""
 }
 
-// prefilter is a sparse Aho-Corasick automaton over mandatory ASCII bytes.
-// Only existence is needed, so terminal output IDs are unnecessary.
+// prefilter is a sparse Aho-Corasick automaton. Every terminal contains a
+// bitmask of candidate machines, not just a Boolean existence flag. Failure
+// links inherit outputs so overlapping/contained literals are never missed.
+// A bit identifies a whole regex group, not a particular regex: the group
+// still verifies matches using its full NFA/DFA.
 type prefilter struct{ nodes []acNode }
 type acNode struct {
-	next     map[byte]int
-	fail     int
-	terminal bool
+	next   map[byte]int
+	fail   int
+	output uint64
 }
 
+// newPrefilter preserves the simple existence matcher for callers/tests.
 func newPrefilter(literals []string) *prefilter {
+	groups := make([]int, len(literals))
+	return newPrefilterGroups(literals, groups)
+}
+
+// groups maps each mandatory literal to its candidate-machine index [0, 63].
+func newPrefilterGroups(literals []string, groups []int) *prefilter {
 	f := &prefilter{nodes: []acNode{{}}}
-	for _, lit := range literals {
+	for i, lit := range literals {
 		at := 0
-		for i := 0; i < len(lit); i++ {
-			ch := lit[i]
-			child, exists := f.nodes[at].next[ch]
-			if !exists {
+		for j := 0; j < len(lit); j++ {
+			ch := lit[j]
+			child, ok := f.nodes[at].next[ch]
+			if !ok {
 				child = len(f.nodes)
 				if f.nodes[at].next == nil {
 					f.nodes[at].next = make(map[byte]int)
@@ -96,7 +106,7 @@ func newPrefilter(literals []string) *prefilter {
 			}
 			at = child
 		}
-		f.nodes[at].terminal = true
+		f.nodes[at].output |= uint64(1) << uint(groups[i])
 	}
 	queue := make([]int, 0, len(f.nodes))
 	for _, child := range f.nodes[0].next {
@@ -107,23 +117,24 @@ func newPrefilter(literals []string) *prefilter {
 		for ch, child := range f.nodes[at].next {
 			next := f.nodes[at].fail
 			for next != 0 {
-				if _, found := f.nodes[next].next[ch]; found {
+				if _, ok := f.nodes[next].next[ch]; ok {
 					break
 				}
 				next = f.nodes[next].fail
 			}
-			if dest, found := f.nodes[next].next[ch]; found {
+			if dest, ok := f.nodes[next].next[ch]; ok {
 				f.nodes[child].fail = dest
 			}
-			f.nodes[child].terminal = f.nodes[child].terminal || f.nodes[f.nodes[child].fail].terminal
+			f.nodes[child].output |= f.nodes[f.nodes[child].fail].output
 			queue = append(queue, child)
 		}
 	}
 	return f
 }
 
-func (f *prefilter) containsAny(input string) bool {
+func (f *prefilter) candidateGroups(input string) uint64 {
 	at := 0
+	var groups uint64
 	for i := 0; i < len(input); i++ {
 		ch := input[i]
 		next, found := f.nodes[at].next[ch]
@@ -136,9 +147,11 @@ func (f *prefilter) containsAny(input string) bool {
 		} else {
 			at = 0
 		}
-		if f.nodes[at].terminal {
-			return true
-		}
+		groups |= f.nodes[at].output
 	}
-	return false
+	return groups
+}
+
+func (f *prefilter) containsAny(input string) bool {
+	return f.candidateGroups(input) != 0
 }

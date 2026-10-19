@@ -44,9 +44,8 @@ type RuleSet struct {
 }
 
 type ruleScratch struct {
-	patternIDs []int
-	hits       []int
-	touched    []int
+	hits    []int
+	touched []int
 }
 
 // CompileRules compiles rules using the default engine limits. Rule order is
@@ -114,8 +113,20 @@ func (s *RuleSet) CacheStats() CacheStats { return s.set.CacheStats() }
 
 // MatchAny reports whether any logical rule is satisfied.
 func (s *RuleSet) MatchAny(input string) bool {
-	_, matched := s.MatchFirstRule(input)
-	return matched
+	if len(s.rules) == 0 {
+		return false
+	}
+	sc := s.pool.Get().(*ruleScratch)
+	defer s.release(sc)
+	found := false
+	s.countMatchesUntil(sc, input, func(index int) bool {
+		if s.satisfied(index, sc.hits[index]) {
+			found = true
+			return true
+		}
+		return false
+	})
+	return found
 }
 
 // MatchFirstRule returns the highest-priority satisfied rule's ID. Priority is
@@ -126,7 +137,9 @@ func (s *RuleSet) MatchFirstRule(input string) (uint32, bool) {
 	}
 	sc := s.pool.Get().(*ruleScratch)
 	defer s.release(sc)
-	s.countMatches(sc, input)
+	s.countMatchesUntil(sc, input, func(index int) bool {
+		return index == 0 && s.satisfied(0, sc.hits[0])
+	})
 	best := len(s.rules)
 	for _, index := range sc.touched {
 		if index < best && s.satisfied(index, sc.hits[index]) {
@@ -174,14 +187,21 @@ func (s *RuleSet) satisfied(index, hits int) bool {
 }
 
 func (s *RuleSet) countMatches(sc *ruleScratch, input string) {
-	sc.patternIDs = s.set.MatchInto(input, sc.patternIDs[:0])
-	for _, patternID := range sc.patternIDs {
+	s.countMatchesUntil(sc, input, nil)
+}
+
+// A rule is complete as soon as its last required pattern arrives. For any
+// existence query we can stop on the first complete rule. For first-priority
+// matching, early exit is safe only when rule index zero is complete.
+func (s *RuleSet) countMatchesUntil(sc *ruleScratch, input string, stop func(int) bool) {
+	s.set.visitMatches(input, func(patternID int) bool {
 		index := s.patternToRule[patternID]
 		if sc.hits[index] == 0 {
 			sc.touched = append(sc.touched, index)
 		}
 		sc.hits[index]++
-	}
+		return stop != nil && stop(index)
+	})
 }
 
 func (s *RuleSet) release(sc *ruleScratch) {
@@ -189,6 +209,5 @@ func (s *RuleSet) release(sc *ruleScratch) {
 		sc.hits[index] = 0
 	}
 	sc.touched = sc.touched[:0]
-	sc.patternIDs = sc.patternIDs[:0]
 	s.pool.Put(sc)
 }

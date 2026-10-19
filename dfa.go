@@ -2,30 +2,55 @@ package regexpset
 
 import (
 	"regexp/syntax"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
+	"unsafe"
 )
 
+const internShardCount = 32
+const edgeBudgetBytes = 64 // conservative map-entry allowance, not a heap-size measurement
+
+type internShard struct {
+	mu     sync.Mutex
+	states map[uint64][]*dfaState
+}
+
+type cacheGeneration struct {
+	initial sync.Map // syntax.EmptyOp -> *dfaState
+	shards  [internShardCount]internShard
+	states  atomic.Int64
+	edges   atomic.Int64
+	bytes   atomic.Int64 // tracked state/edge reservations (not full process RSS)
+}
+
 type machine struct {
-	inst      []syntax.Inst
-	starts    []uint32
-	matchIDs  []int
-	count     int // number of original rules (ID namespace)
-	ruleCount int // number of rules in this NFA
-	prefilter *prefilter
+	inst         []syntax.Inst
+	starts       []uint32
+	matchIDs     []int
+	literalTries map[literalAnchor]*literalNode
+	compiled     map[string][]uint32
+	aliases      map[uint32][]int
+	count        int
+	ruleCount    int
+	prefilter    *prefilter // retained for existing internal/test usage
 
 	maxStates, maxTransitions int
+	maxBytes                  int64
 	resetOnFull               bool
-	epoch                     uint64
-	resets                    int
+	resets                    atomic.Int64
+	generation                atomic.Pointer[cacheGeneration]
+	resetMu                   sync.Mutex
 	asciiClass                [128]uint8
 	asciiClasses              int
+	unicodeBounds             []rune
+	unicodeClass              []int32
+	unicodeClasses            int
 
-	mu                    sync.Mutex
-	states                map[uint64][]*dfaState
-	initial               map[syntax.EmptyOp]*dfaState
-	stateCount, edgeCount int
-	pool                  sync.Pool
+	startMu    sync.Mutex
+	startCache map[syntax.EmptyOp]*dfaState
+	pool       sync.Pool
 }
 
 type edgeKey struct {
@@ -37,28 +62,33 @@ type dfaState struct {
 	ready   []uint32
 	matches []int
 	cached  bool
-	epoch   uint64
+	owner   *cacheGeneration
 	mu      sync.RWMutex
 	edges   map[edgeKey]*dfaState
 }
 
-func newMachine(count, rules, maxStates, maxTransitions int, resetOnFull bool) *machine {
-	return &machine{
+func newMachine(count, rules, maxStates, maxTransitions int, maxBytes int64, resetOnFull bool) *machine {
+	m := &machine{
 		count: count, ruleCount: rules, maxStates: maxStates,
-		maxTransitions: maxTransitions,
-		resetOnFull:    resetOnFull,
-		states:         make(map[uint64][]*dfaState),
-		initial:        make(map[syntax.EmptyOp]*dfaState),
+		maxTransitions: maxTransitions, maxBytes: maxBytes,
+		resetOnFull: resetOnFull,
+		startCache:  make(map[syntax.EmptyOp]*dfaState),
+		compiled:    make(map[string][]uint32),
+		aliases:     make(map[uint32][]int),
 	}
+	m.generation.Store(new(cacheGeneration))
+	return m
 }
 
 func (m *machine) cacheStats() CacheStats {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return CacheStats{States: m.stateCount, Transitions: m.edgeCount, ASCIIClasses: m.asciiClasses, Resets: m.resets}
+	g := m.generation.Load()
+	return CacheStats{
+		States: int(g.states.Load()), Transitions: int(g.edges.Load()),
+		Bytes: g.bytes.Load(), ASCIIClasses: m.asciiClasses,
+		UnicodeClasses: m.unicodeClasses, Resets: int(m.resets.Load()),
+	}
 }
 
-// nextRune follows regexp's malformed UTF-8 behavior (RuneError, width 1).
 func nextRune(text string, pos int) rune {
 	if pos >= len(text) {
 		return -1
@@ -120,27 +150,53 @@ func (m *machine) matchInto(text string, dst []int) []int {
 	return dst
 }
 
+// visit streams each distinct accepting pattern ID to emit. Returning true
+// stops matching immediately, without materializing or sorting an ID list.
+func (m *machine) visit(text string, emit func(int) bool) bool {
+	sc := m.pool.Get().(*scratch)
+	defer func() {
+		for _, id := range sc.ids {
+			sc.matched[id] = false
+		}
+		sc.ids = sc.ids[:0]
+		m.pool.Put(sc)
+	}()
+	sc.ids = sc.ids[:0]
+	collect := func(state *dfaState) bool {
+		previous := len(sc.ids)
+		m.collect(sc, state.matches)
+		for _, id := range sc.ids[previous:] {
+			if emit(id) {
+				return true
+			}
+		}
+		return false
+	}
+	state := m.begin(nextRune(text, 0), sc)
+	if collect(state) {
+		return true
+	}
+	for pos := 0; pos < len(text) && len(sc.ids) < m.ruleCount; {
+		r, width := consumeRune(text, pos)
+		pos += width
+		state = m.advance(state, r, syntax.EmptyOpContext(r, nextRune(text, pos)), sc)
+		if collect(state) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *machine) begin(next rune, sc *scratch) *dfaState {
 	ctx := syntax.EmptyOpContext(-1, next)
-	m.mu.Lock()
-	state := m.initial[ctx]
-	m.mu.Unlock()
-	if state != nil {
-		return state
+	g := m.generation.Load()
+	if cached, ok := g.initial.Load(ctx); ok {
+		return cached.(*dfaState)
 	}
-	state = m.intern(m.closure(nil, ctx, sc))
-	if state.cached {
-		m.mu.Lock()
-		if state.epoch != m.epoch {
-			m.mu.Unlock()
-			return state
-		}
-		if old := m.initial[ctx]; old != nil {
-			state = old
-		} else {
-			m.initial[ctx] = state
-		}
-		m.mu.Unlock()
+	state := m.intern(m.closure(nil, ctx, sc))
+	if state.cached && state.owner == m.generation.Load() {
+		old, _ := state.owner.initial.LoadOrStore(ctx, state)
+		return old.(*dfaState)
 	}
 	return state
 }
@@ -149,7 +205,11 @@ func (m *machine) symbol(r rune) int32 {
 	if r >= 0 && r < 128 {
 		return int32(m.asciiClass[r])
 	}
-	return int32(128 + r) // no overlap with ASCII equivalence-class IDs
+	if len(m.unicodeBounds) > 0 {
+		i := sort.Search(len(m.unicodeBounds), func(i int) bool { return m.unicodeBounds[i] > r }) - 1
+		return 128 + m.unicodeClass[i]
+	}
+	return int32(128 + r)
 }
 
 func (m *machine) advance(state *dfaState, r rune, ctx syntax.EmptyOp, sc *scratch) *dfaState {
@@ -170,40 +230,35 @@ func (m *machine) advance(state *dfaState, r rune, ctx syntax.EmptyOp, sc *scrat
 		}
 	}
 	next := m.intern(m.closure(sc.raw, ctx, sc))
-	if state.cached && next.cached {
-		m.mu.Lock()
-		if m.edgeCount >= m.maxTransitions && m.resetOnFull && m.maxTransitions > 0 {
-			m.resetLocked()
-		}
-		if m.edgeCount < m.maxTransitions && state.epoch == m.epoch && next.epoch == m.epoch {
-			state.mu.Lock()
+	if state.cached && next.cached && state.owner == next.owner && state.owner == m.generation.Load() {
+		g := state.owner
+		state.mu.Lock()
+		if existing := state.edges[key]; existing != nil {
+			next = existing
+		} else if m.reserveEdge(g) {
 			if state.edges == nil {
 				state.edges = make(map[edgeKey]*dfaState)
 			}
-			if old := state.edges[key]; old != nil {
-				next = old
-			} else {
-				state.edges[key] = next
-				m.edgeCount++
-			}
-			state.mu.Unlock()
+			state.edges[key] = next
+		} else if m.resetOnFull && m.maxTransitions > 0 {
+			m.resetGeneration(g)
 		}
-		m.mu.Unlock()
+		state.mu.Unlock()
 	}
 	return next
 }
 
 func hashState(state *dfaState) uint64 {
 	const prime uint64 = 1099511628211
-	hash := uint64(14695981039346656037)
+	h := uint64(14695981039346656037)
 	for _, pc := range state.ready {
-		hash = (hash ^ uint64(pc+1)) * prime
+		h = (h ^ uint64(pc+1)) * prime
 	}
-	hash = (hash ^ uint64(0xffffffff)) * prime
+	h = (h ^ uint64(0xffffffff)) * prime
 	for _, id := range state.matches {
-		hash = (hash ^ uint64(id+1)) * prime
+		h = (h ^ uint64(id+1)) * prime
 	}
-	return hash
+	return h
 }
 
 func equalState(a, b *dfaState) bool {
@@ -223,41 +278,92 @@ func equalState(a, b *dfaState) bool {
 	return true
 }
 
+// The shard lock covers only states whose hashes map to that shard. No global
+// mutex is acquired on an intern hit or when reserving a fresh state.
 func (m *machine) intern(candidate *dfaState) *dfaState {
-	// Uncached states can borrow the current match's scratch slices; they
-	// remain valid until the next advance, which consumes them before closure.
 	if m.maxStates == 0 {
 		return candidate
 	}
+	g := m.generation.Load()
 	key := hashState(candidate)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, existing := range m.states[key] {
+	shard := &g.shards[int(key%internShardCount)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	for _, existing := range shard.states[key] {
 		if equalState(candidate, existing) {
 			return existing
 		}
 	}
-	if m.stateCount >= m.maxStates && m.resetOnFull {
-		m.resetLocked()
+	if !m.reserveState(g, candidate) {
+		if m.resetOnFull {
+			m.resetGeneration(g)
+		}
+		return candidate
 	}
-	if m.stateCount < m.maxStates {
-		candidate.epoch = m.epoch
-		candidate.ready = append([]uint32(nil), candidate.ready...)
-		candidate.matches = append([]int(nil), candidate.matches...)
-		candidate.cached = true
-		m.states[key] = append(m.states[key], candidate)
-		m.stateCount++
+	candidate.ready = append([]uint32(nil), candidate.ready...)
+	candidate.matches = append([]int(nil), candidate.matches...)
+	candidate.cached = true
+	candidate.owner = g
+	if shard.states == nil {
+		shard.states = make(map[uint64][]*dfaState)
 	}
+	shard.states[key] = append(shard.states[key], candidate)
 	return candidate
 }
 
-// resetLocked disconnects the cache without mutating existing states. Readers
-// already holding states from prior generations may finish safely; stale edges
-// remain correct but are not inserted into the new generation.
-func (m *machine) resetLocked() {
-	m.states = make(map[uint64][]*dfaState)
-	m.initial = make(map[syntax.EmptyOp]*dfaState)
-	m.stateCount, m.edgeCount = 0, 0
-	m.epoch++
-	m.resets++
+func reserve(limit int64, count *atomic.Int64, delta int64) bool {
+	if limit <= 0 {
+		return false
+	}
+	for {
+		old := count.Load()
+		if delta > limit-old {
+			return false
+		}
+		if count.CompareAndSwap(old, old+delta) {
+			return true
+		}
+	}
+}
+
+func (m *machine) reserveState(g *cacheGeneration, state *dfaState) bool {
+	if m.maxBytes < 0 || !reserve(int64(m.maxStates), &g.states, 1) {
+		return false
+	}
+	// Tracked memory is an estimated upper accounting of state objects, their
+	// slices, and map-related overhead; Go maps/pools/GC are not in this budget.
+	cost := int64(unsafe.Sizeof(dfaState{})) + int64(len(state.ready))*4 + int64(len(state.matches))*int64(unsafe.Sizeof(int(0))) + 64
+	if m.maxBytes > 0 && !reserve(m.maxBytes, &g.bytes, cost) {
+		g.states.Add(-1)
+		return false
+	}
+	if m.maxBytes <= 0 {
+		g.bytes.Add(cost)
+	}
+	return true
+}
+
+func (m *machine) reserveEdge(g *cacheGeneration) bool {
+	if !reserve(int64(m.maxTransitions), &g.edges, 1) {
+		return false
+	}
+	if m.maxBytes > 0 && !reserve(m.maxBytes, &g.bytes, edgeBudgetBytes) {
+		g.edges.Add(-1)
+		return false
+	}
+	if m.maxBytes <= 0 {
+		g.bytes.Add(edgeBudgetBytes)
+	}
+	return true
+}
+
+// A reset swaps in a new generation without touching old maps or edges.
+// Readers holding the old generation remain safe and can finish matching.
+func (m *machine) resetGeneration(old *cacheGeneration) {
+	m.resetMu.Lock()
+	if m.generation.Load() == old {
+		m.generation.Store(new(cacheGeneration))
+		m.resets.Add(1)
+	}
+	m.resetMu.Unlock()
 }

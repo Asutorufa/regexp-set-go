@@ -5,6 +5,7 @@ package regexpset
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math/bits"
 	"regexp/syntax"
 	"sort"
@@ -15,9 +16,16 @@ import (
 type Options struct {
 	MaxStates      int
 	MaxTransitions int
+	// MaxCacheBytes limits estimated retained DFA state/edge reservations.
+	// Zero means no byte budget; compiled NFAs, AC and scratch are excluded.
+	MaxCacheBytes int64
 	// DisablePrefilter disables conservative mandatory-literal extraction.
 	// The default uses an Aho-Corasick rejection filter for eligible rules.
 	DisablePrefilter bool
+	// DisableCandidateShards keeps one eligible-pattern DFA machine rather
+	// than partitioning into multiple AC-selected candidate groups. This can
+	// improve throughput on high-hit or high-cardinality inputs.
+	DisableCandidateShards bool
 	// ResetCacheOnFull enables whole-generation cache recycling. It trades
 	// extra compilation work for adaptability when input distributions change.
 	ResetCacheOnFull bool
@@ -26,17 +34,21 @@ type Options struct {
 // CacheStats reports retained deterministic states and transitions across both
 // engines. ASCIIClasses is the number of input equivalence classes in use.
 type CacheStats struct {
-	States       int
-	Transitions  int
-	ASCIIClasses int
-	Resets       int
+	States         int
+	Transitions    int
+	Bytes          int64
+	UnicodeClasses int
+	ASCIIClasses   int
+	Resets         int
 }
 
 // Set is immutable except for synchronized caches and safe for concurrent use.
 // Each expression is assigned its original zero-based index, even for duplicates.
 type Set struct {
-	count  int
-	groups []*machine
+	count      int
+	groups     []*machine
+	candidates *prefilter
+	groupBits  []uint64 // zero means unconditional, otherwise requires matching AC bucket
 }
 
 // Compile compiles patterns using bounded caches and safe literal prefiltering.
@@ -45,7 +57,7 @@ func Compile(patterns []string) (*Set, error) { return CompileWithOptions(patter
 // CompileWithOptions compiles Go regexp syntax (regexp/syntax.Perl). Matches
 // are substring/existence matches, as in regexp.Regexp.MatchString.
 func CompileWithOptions(patterns []string, opts Options) (*Set, error) {
-	if opts.MaxStates < 0 || opts.MaxTransitions < 0 {
+	if opts.MaxStates < 0 || opts.MaxTransitions < 0 || opts.MaxCacheBytes < 0 {
 		return nil, fmt.Errorf("regexpset: cache limits must be non-negative")
 	}
 	if opts.MaxStates == 0 {
@@ -73,26 +85,68 @@ func CompileWithOptions(patterns []string, opts Options) (*Set, error) {
 	}
 	result := &Set{count: len(patterns)}
 	var gs []patternGroup
-	if len(regular) != 0 {
+	if len(regular) > 0 {
 		gs = append(gs, patternGroup{patterns: regular})
 	}
-	if len(eligible) != 0 {
-		gs = append(gs, patternGroup{patterns: eligible, filter: true})
+	if len(eligible) > 0 {
+		// For large sets, partition eligible patterns into independently cached
+		// machines. The AC output tells us which machines to run. This avoids
+		// making DFA state identity depend on per-input candidate bitmaps.
+		shards := (len(eligible) + 511) / 512
+		if opts.DisableCandidateShards {
+			shards = 1
+		}
+		if shards < 1 {
+			shards = 1
+		}
+		if shards > 16 {
+			shards = 16
+		}
+		buckets := make([][]compiledPattern, shards)
+		literals := make([]string, 0, len(eligible))
+		assigned := make([]int, 0, len(eligible))
+		for _, p := range eligible {
+			h := fnv.New32a()
+			_, _ = h.Write([]byte(p.literal))
+			bucket := int(h.Sum32() % uint32(shards))
+			buckets[bucket] = append(buckets[bucket], p)
+		}
+		// Allocate compact candidate IDs (avoid empty buckets).
+		for _, bucket := range buckets {
+			if len(bucket) == 0 {
+				continue
+			}
+			index := len(gs) - 0 // actual Set.groups index, regular comes first
+			for _, p := range bucket {
+				literals = append(literals, p.literal)
+				assigned = append(assigned, index)
+			}
+			gs = append(gs, patternGroup{patterns: bucket, filter: true})
+		}
+		result.candidates = newPrefilterGroups(literals, assigned)
 	}
-
-	// Budget is shared across the engines, including when either limit is 1.
-	// The engine with the most rules gets the remainder of each budget.
 	stateBudgets := splitBudget(opts.MaxStates, gs)
 	edgeBudgets := splitBudget(opts.MaxTransitions, gs)
-	for i, g := range gs {
-		m := newMachine(len(patterns), len(g.patterns), stateBudgets[i], edgeBudgets[i], opts.ResetCacheOnFull)
-		if g.filter {
-			literals := make([]string, len(g.patterns))
-			for j, p := range g.patterns {
-				literals[j] = p.literal
-			}
-			m.prefilter = newPrefilter(literals)
+	var byteBudgets []int
+	if opts.MaxCacheBytes > 0 {
+		// Int is at least 64-bit on mainstream targets used in CI; clamp on
+		// 32-bit systems rather than overflow when splitting.
+		maxInt := uint64(^uint(0) >> 1)
+		budget := opts.MaxCacheBytes
+		if uint64(budget) > maxInt {
+			budget = int64(maxInt)
 		}
+		byteBudgets = splitBudget(int(budget), gs)
+	}
+	for i, g := range gs {
+		bytes := int64(0)
+		if byteBudgets != nil {
+			bytes = int64(byteBudgets[i])
+			if bytes == 0 {
+				bytes = -1
+			} // group cannot retain any state
+		}
+		m := newMachine(len(patterns), len(g.patterns), stateBudgets[i], edgeBudgets[i], bytes, opts.ResetCacheOnFull)
 		for _, p := range g.patterns {
 			if err := m.add(p.id, p.tree); err != nil {
 				return nil, fmt.Errorf("regexpset: pattern %d: %w", p.id, err)
@@ -100,6 +154,11 @@ func CompileWithOptions(patterns []string, opts Options) (*Set, error) {
 		}
 		m.finish()
 		result.groups = append(result.groups, m)
+		if g.filter {
+			result.groupBits = append(result.groupBits, uint64(1)<<uint(i))
+		} else {
+			result.groupBits = append(result.groupBits, 0)
+		}
 	}
 	return result, nil
 }
@@ -142,7 +201,14 @@ func (s *Set) Len() int { return s.count }
 
 // MatchAny reports whether at least one pattern matches the input.
 func (s *Set) MatchAny(input string) bool {
-	for _, g := range s.groups {
+	candidates := ^uint64(0)
+	if s.candidates != nil {
+		candidates = s.candidates.candidateGroups(input)
+	}
+	for i, g := range s.groups {
+		if s.groupBits[i] != 0 && candidates&s.groupBits[i] == 0 {
+			continue
+		}
 		if g.matchAny(input) {
 			return true
 		}
@@ -157,11 +223,37 @@ func (s *Set) MatchIDs(input string) []int { return s.MatchInto(input, nil) }
 // It never aliases internal cached storage.
 func (s *Set) MatchInto(input string, dst []int) []int {
 	dst = dst[:0]
-	for _, g := range s.groups {
+	candidates := ^uint64(0)
+	if s.candidates != nil {
+		candidates = s.candidates.candidateGroups(input)
+	}
+	for i, g := range s.groups {
+		if s.groupBits[i] != 0 && candidates&s.groupBits[i] == 0 {
+			continue
+		}
 		dst = g.matchInto(input, dst)
 	}
 	sort.Ints(dst)
 	return dst
+}
+
+// visitMatches streams distinct pattern IDs, including across the two
+// optional prefilter/regular partitions. A true callback response stops the
+// scan; ID ordering is intentionally not guaranteed.
+func (s *Set) visitMatches(input string, emit func(int) bool) bool {
+	candidates := ^uint64(0)
+	if s.candidates != nil {
+		candidates = s.candidates.candidateGroups(input)
+	}
+	for i, g := range s.groups {
+		if s.groupBits[i] != 0 && candidates&s.groupBits[i] == 0 {
+			continue
+		}
+		if g.visit(input, emit) {
+			return true
+		}
+	}
+	return false
 }
 
 // CacheStats returns an aggregate snapshot of retained cache entries.
@@ -171,6 +263,8 @@ func (s *Set) CacheStats() CacheStats {
 		v := g.cacheStats()
 		stats.States += v.States
 		stats.Transitions += v.Transitions
+		stats.Bytes += v.Bytes
+		stats.UnicodeClasses += v.UnicodeClasses
 		stats.ASCIIClasses += v.ASCIIClasses
 		stats.Resets += v.Resets
 	}

@@ -10,6 +10,19 @@ import (
 // their original IDs. Captures are epsilon transitions because we report
 // existence only, not submatch locations or match ordering.
 func (m *machine) add(id int, tree *syntax.Regexp) error {
+	// Canonically equivalent expressions share compiled instructions. Distinct
+	// Pattern IDs are still reported independently (important for RuleAND).
+	// This factors complete duplicate programs, NOT arbitrary shared prefixes.
+	key := tree.String()
+	if matchPCs, ok := m.compiled[key]; ok {
+		for _, pc := range matchPCs {
+			m.aliases[pc] = append(m.aliases[pc], id)
+		}
+		return nil
+	}
+	if m.tryLiteralTrie(id, tree) {
+		return nil
+	}
 	p, err := syntax.Compile(tree)
 	if err != nil {
 		return err
@@ -18,6 +31,7 @@ func (m *machine) add(id int, tree *syntax.Regexp) error {
 		return fmt.Errorf("combined NFA instruction limit exceeded")
 	}
 	offset := uint32(len(m.inst))
+	matchPCs := make([]uint32, 0, 1)
 	m.starts = append(m.starts, offset+uint32(p.Start))
 	for _, inst := range p.Inst {
 		switch inst.Op {
@@ -31,16 +45,20 @@ func (m *machine) add(id int, tree *syntax.Regexp) error {
 		}
 		m.inst = append(m.inst, inst)
 		if inst.Op == syntax.InstMatch {
+			matchPCs = append(matchPCs, uint32(len(m.matchIDs)))
 			m.matchIDs = append(m.matchIDs, id)
 		} else {
 			m.matchIDs = append(m.matchIDs, -1)
 		}
 	}
+	m.compiled[key] = matchPCs
 	return nil
 }
 
 func (m *machine) finish() {
+	m.finishLiteralTrie()
 	m.buildASCIIClasses()
+	m.buildUnicodeClasses()
 	n, count := len(m.inst), m.count
 	m.pool = sync.Pool{New: func() any { return &scratch{seen: make([]uint32, n), matched: make([]bool, count)} }}
 }
