@@ -77,9 +77,12 @@ ids = set.MatchInto("foobar", ids) // reuse caller-owned buffer
    leading trie instructions. Complex expressions fall back to normal NFA
    compilation. Pattern IDs are preserved, including duplicates.
 2. Extract a *provably required* ASCII substring where possible. A sparse
-   Aho-Corasick automaton emits a bitmask of **candidate NFA/DFA groups**.
-   Patterns without a required literal remain unfiltered. The AC automaton
-   never decides a real regex match: it only safely rules out impossible groups.
+   Aho-Corasick automaton emits both a bitmask of candidate NFA/DFA groups
+   and **individual candidate Pattern IDs**. Patterns without a required
+   literal remain unfiltered. When at most 16 individual candidates survive
+   and are at most 1/8 of all eligible patterns, compiled Go `regexp` verifies
+   only those candidates. Dense hits fall back to the shared lazy DFA. AC
+   only proves necessary conditions; it never declares a regex match.
 3. Evaluate the selected Thompson NFAs using lazy subset-construction DFA
    states. Each state contains consuming instruction PCs and accepting pattern
    IDs; transitions are cached by `(character equivalence class, zero-width
@@ -90,7 +93,9 @@ ids = set.MatchInto("foobar", ids) // reuse caller-owned buffer
    DFA states reuse match-local scratch storage.
 5. `RuleSet` streams distinct accepting pattern IDs into per-rule counters,
    computes AND/OR, and chooses the earliest satisfied rule by declared
-   priority. It never creates a distinct DFA per logical rule.
+   priority. Exact AC candidate bits also eliminate impossible earlier rules
+   without skipping viable AND requirements. It never creates a distinct DFA
+   per logical rule.
 
 These are **conservative transformations**. Regex behavior is checked against
 Go's `regexp` in randomized, corpus, fuzz and concurrent tests. More details:
@@ -106,6 +111,8 @@ set, err := regexpset.CompileRulesWithOptions(rules, regexpset.Options{
     MaxCacheBytes:          16 << 20,   // optional estimated reservation budget
     DisablePrefilter:       false,      // enable conservative AC filtering
     DisableCandidateShards: false,      // optional grouping; benchmark hit rate
+    DisableExactCandidates: false,     // default: use exact regex verification when sparse
+    EvictLRU:              false,      // opt-in per-state recency-based eviction
     ResetCacheOnFull:       false,      // opt-in whole-generation recycling
 })
 if err != nil { panic(err) }
@@ -115,10 +122,19 @@ fmt.Printf("cache: %+v\n", set.CacheStats())
 `MaxCacheBytes` and `CacheStats.Bytes` count **estimated retained state/edge
 reservations**, not process RSS or exact heap allocations. The NFA, AC nodes,
 start closures, goroutine-local scratch, map overhead and old generations
-awaiting GC are outside that accounting. This is **not a hard memory sandbox**.
+awaiting GC, **and separately compiled `regexp` candidate verifiers** are
+outside that accounting. This is **not a hard heap/RSS memory sandbox**.
 A zero state/transition option selects the default; negative limits fail.
-Exhausted caches fall back to correct uncached NFA-derived states. Whole
-cache-generation replacement is not LRU and may perform worse on tiny caches.
+By default a full cache falls back to correct uncached NFA-derived states.
+With `EvictLRU`, old individual states and their incoming cached transitions
+are removed under synchronization (scanning cached states on an eviction),
+allowing subsequent states to be admitted. Recency tracking is approximate
+under concurrent matches. Eviction can significantly increase contention and
+allocations; it is not a performance guarantee. `ResetCacheOnFull` is a distinct
+whole-generation policy and should normally not be combined with `EvictLRU`.
+`CacheStats.Evictions` reports evictions in currently retained generations.
+`EvictLRU` and `ResetCacheOnFull` are mutually exclusive to avoid surprising
+cache-policy transitions.
 
 ## Benchmarks
 
@@ -134,6 +150,8 @@ with `go test -run '^$' -bench ... -benchmem`:
 | `BenchmarkLiteralTrieOracles`, `BenchmarkGeneralPrefixFactoring` | Literal and generic deterministic-prefix sharing vs separate `regexp` |
 | `BenchmarkRuleSetPriorityStreaming`, `BenchmarkRuleSetCandidatePriorityPruning` | Rule-level short-circuiting and priority proof |
 | `BenchmarkCacheBudget`, `BenchmarkRuleSetTinyCache` | Cold/underfunded cache and generation recycling |
+| `BenchmarkExactCandidates` | Sparse candidate verification vs full shared DFA, miss and hit |
+| `BenchmarkEvictLRU` | Opt-in per-state LRU versus correct uncached fallback |
 | `BenchmarkCompile` | Parsing and automaton construction time |
 
 ```sh
@@ -141,6 +159,7 @@ go test -run '^$' -bench '^BenchmarkMatch$' -benchmem -benchtime=1s ./...
 go test -run '^$' -bench '^BenchmarkRuleSet' -benchmem -benchtime=1s ./...
 go test -run '^$' -bench 'BenchmarkCandidateShardsHighCardinality|BenchmarkGeneralPrefixFactoring|BenchmarkRuleSetCandidatePriorityPruning' -benchmem ./...
 go test -run '^$' -bench '^BenchmarkCacheBudget$' -benchmem ./...
+go test -run '^$' -bench 'BenchmarkExactCandidates|BenchmarkEvictLRU' -benchmem ./...
 ```
 
 ### Illustrative measured results
@@ -177,7 +196,7 @@ go test -fuzz '^FuzzMatchesRegexp$' -fuzztime=30s .
 go test -fuzz '^FuzzRuleSetAgainstRegexp$' -fuzztime=30s .
 ```
 
-Not yet implemented: exact RSS caps, adaptive per-state LRU eviction, SIMD,
+Not yet implemented: exact process-heap/RSS caps, O(1) LRU eviction, SIMD,
 full Unicode folding-aware equivalence classes, fully general shared regex
 prefixes, incremental streaming, and nested/field-aware logical expressions.
 Do not interpret the presence of a feature as proof it is faster for all

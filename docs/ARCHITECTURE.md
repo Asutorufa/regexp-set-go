@@ -27,8 +27,10 @@ priority. It does not create one DFA per logical rule.
 ## Matching invariants
 
 1. A prefilter is a **necessary** test only; it cannot exclude a matching
-   pattern. Candidate masks select machines, not individual dynamic DFA
-   frontiers. This avoids input-specific DFA cache identities.
+   pattern. AC outputs candidate machine masks and individual pattern IDs.
+   Sparse candidate sets are checked using precompiled Go regexes; dense
+   candidates use the shared DFA. Candidate sets never become DFA identities,
+   avoiding input-dependent state explosion.
 2. Each rune boundary implicitly starts new unanchored matches; start
    epsilon closures are cached by the exact `syntax.EmptyOp` boundary context.
    Anchored-prefix trie roots check their own beginning assertion.
@@ -43,11 +45,15 @@ priority. It does not create one DFA per logical rule.
 6. Uncached DFA state objects borrow a per-call scratch object. Cache inserts
    publish separately allocated deep copies with no aliases into scratch.
 7. A cache generation switch never mutates old states held by concurrent
-   readers. Intern shards, per-state transition locks and atomic budget
-   reservations are synchronized.
+   readers. With optional per-state LRU, eviction removes a victim's intern
+   entry and inbound edges under a generation-wide eviction lock; readers
+   holding a temporary pointer can finish safely without resurrecting the
+   evicted state. Intern shards, per-state locks and atomic budgets are
+   synchronized.
 8. Rule priorities use array order. Lower-priority early matches cannot
-   defeat unresolved higher-priority AND rules. AC candidate-group exclusions
-   can prove that a higher-priority rule is impossible, allowing early return.
+   defeat unresolved higher-priority AND rules. AC **per-pattern** necessary
+   literals can prove a higher-priority rule impossible, allowing safe early
+   returns without declaring a false regex match.
 
 ## Complexity and tradeoffs
 
@@ -60,9 +66,13 @@ DFA state space may still be exponential in NFA program complexity. A
 state-count and an **estimated byte reservation** budget bound retained
 accounted cache entries but **not** RSS or complete Go heap use. Compiled
 programs, AC tries, scratch pools, old GC generations and map overhead are
-outside the budget. Replacing the whole generation is optional, not LRU.
+outside the budget. Optional `EvictLRU` chooses the oldest approximately
+observed state, deletes its inbound cached transitions, and permits admission
+of a replacement. This is a potentially expensive O(number of retained states)
+scan per eviction, **not** a constant-time LRU. Whole-generation reset is a
+separate, opt-in alternative. Neither policy enforces Go heap/RSS limits.
 
-Partial optimizations intentionally left conservative: AC only narrows to
-pattern groups; generic arbitrary-prefix automaton factoring, precise
-memory accounting, per-state eviction and complete Unicode casefolding-aware
-classes are substantial remaining work. See `OPTIMIZATIONS.md`.
+Remaining limits: exact byte-level Go heap allocation control, O(1) eviction,
+generic arbitrary-prefix automaton factoring and complete Unicode
+casefolding-aware classes. Per-pattern verification duplicates some compiled
+regular-expression memory outside the DFA budget. See `OPTIMIZATIONS.md`.
