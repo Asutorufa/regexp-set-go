@@ -50,8 +50,9 @@ func main() {
 - **AND**: every expression matches somewhere in the same input. Their
   matched spans need not overlap or be adjacent.
 - Both operators can coexist in a `RuleSet`; duplicated pattern strings retain
-  separate identities, and logical rule IDs must be unique. Nested Boolean
-  groups and different-field predicates (Host AND Path) are not provided.
+  separate identities, and logical rule IDs must be unique. Flat `RuleSet`
+  handles one input field; `FieldRuleSet` below supports nested AND/OR/NOT
+  expressions across Host, Path, Method and other named fields.
 - `MatchFirstRule` may stop before reading the whole input **only when it can
   prove no higher-priority rule remains possible**. An early lower-priority
   substring is *not* sufficient for an early return.
