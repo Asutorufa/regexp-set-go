@@ -80,6 +80,8 @@ type prefilter struct {
 	nodes        []acNode
 	pool         sync.Pool
 	patternCount int
+	rootByte     byte
+	oneRoot      bool
 }
 type candidateScratch struct {
 	groups uint64
@@ -155,10 +157,25 @@ func newPrefilterPatterns(literals []string, groups, patterns []int, patternCoun
 			queue = append(queue, child)
 		}
 	}
+	if len(f.nodes[0].next) == 1 {
+		f.oneRoot = true
+		for b := range f.nodes[0].next {
+			f.rootByte = b
+		}
+	}
 	return f
 }
 
+// rejectsAtRoot uses SIMD for a necessary first byte common to all literals.
+// Small inputs skip the preliminary scan to avoid paying for two passes.
+func (f *prefilter) rejectsAtRoot(input string) bool {
+	return f.oneRoot && len(input) >= 64 && !fastContainsByte(input, f.rootByte)
+}
+
 func (f *prefilter) candidateGroups(input string) uint64 {
+	if f.rejectsAtRoot(input) {
+		return 0
+	}
 	at := 0
 	var groups uint64
 	for i := 0; i < len(input); i++ {
@@ -188,6 +205,9 @@ func (f *prefilter) candidatePatterns(input string) *candidateScratch {
 	sc := f.pool.Get().(*candidateScratch)
 	sc.ids = sc.ids[:0]
 	sc.groups = 0
+	if f.rejectsAtRoot(input) {
+		return sc
+	}
 	at := 0
 	for i := 0; i < len(input); i++ {
 		ch := input[i]

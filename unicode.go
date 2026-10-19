@@ -3,25 +3,25 @@ package regexpset
 import (
 	"regexp/syntax"
 	"sort"
+	"unicode"
 	"unicode/utf8"
 )
 
-// buildUnicodeClasses partitions non-ASCII runes at every possible boundary of
-// a consuming instruction. Adjacent ranges are joined only if EVERY rune
-// instruction agrees about their representative runes. Case-folded rune
-// instructions are deliberately excluded: their Unicode simple-fold cycles
-// need more boundaries than the raw instruction intervals supply.
-// Limits avoid excessive compilation work on giant Unicode-heavy corpora.
+// buildUnicodeClasses computes exact consuming-instruction equivalence ranges.
+// For folded programs, boundaries also cover every Unicode SimpleFold cycle
+// member. This includes the special non-ASCII members of ASCII cycles (the
+// Kelvin sign and long s), as well as nonlocal Greek sigma variants.
+// Large programs use an exact, lazy signature interner instead of a quadratic
+// eager compile, not an unsafe approximate equivalence table.
 func (m *machine) buildUnicodeClasses() {
 	bounds := []rune{128, utf8.MaxRune + 1}
-	var folding bool
+	folded := false
+	consumers := 0
 	for _, inst := range m.inst {
 		switch inst.Op {
-		case syntax.InstRune1, syntax.InstRune:
-			if inst.Arg&uint32(syntax.FoldCase) != 0 {
-				folding = true
-				continue
-			}
+		case syntax.InstRune, syntax.InstRune1:
+			consumers++
+			folded = folded || inst.Arg&uint32(syntax.FoldCase) != 0
 			if len(inst.Rune) == 1 {
 				bounds = appendBounds(bounds, inst.Rune[0], inst.Rune[0])
 			} else {
@@ -29,14 +29,25 @@ func (m *machine) buildUnicodeClasses() {
 					bounds = appendBounds(bounds, inst.Rune[j], inst.Rune[j+1])
 				}
 			}
+		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			consumers++
 		}
-		if len(bounds) > 4096 {
+		if len(bounds) > 65536 {
+			m.unicodeConsumers = countUnicodeConsumers(m.inst)
+			m.unicodeLazy = true
 			return
 		}
 	}
-	if folding {
-		m.buildFoldAwareUnicodeClasses()
+	m.unicodeConsumers = consumers
+	if consumers == 0 {
 		return
+	}
+	if folded {
+		for r := rune(128); r <= utf8.MaxRune; r++ {
+			if unicode.SimpleFold(r) != r {
+				bounds = append(bounds, r, r+1)
+			}
+		}
 	}
 	sort.Slice(bounds, func(i, j int) bool { return bounds[i] < bounds[j] })
 	n := 0
@@ -47,7 +58,10 @@ func (m *machine) buildUnicodeClasses() {
 		}
 	}
 	bounds = bounds[:n]
-	if n < 2 || uint64(n)*uint64(len(m.inst)) > 2_000_000 {
+	// The eagerly computed classes are strictly exact, but O(intervals *
+	// consumers). Large compiles switch to equally exact lazy equivalence.
+	if n < 2 || uint64(n)*uint64(consumers) > 4_000_000 {
+		m.unicodeLazy = true
 		return
 	}
 	classes := make([]int32, n-1)
@@ -92,61 +106,54 @@ func sameUnicodeActions(insts []syntax.Inst, a, b rune) bool {
 	return true
 }
 
-// buildFoldAwareUnicodeClasses makes exact input-character equivalence classes
-// for small programs containing FoldCase instructions. Unicode SimpleFold is
-// not limited to adjacent code points or simple ASCII upper/lower pairs (e.g.
-// Kelvin sign, long s, Greek sigma). Scanning every Unicode scalar and using
-// syntax.Inst.MatchRune itself avoids assumptions about the folding tables.
-// A work budget prevents huge rule sets from taking unbounded compile time;
-// the fallback (no Unicode equivalence table) remains exact.
-func (m *machine) buildFoldAwareUnicodeClasses() {
-	consumers := make([]*syntax.Inst, 0, 8)
-	for i := range m.inst {
-		switch m.inst[i].Op {
+// lazyUnicodeClass interns complete rune-acceptance signatures. It is exact for
+// every possible Unicode scalar including FoldCase when the eager table would
+// require too much compile-time work. All synchronization is per-machine.
+func (m *machine) lazyUnicodeClass(r rune) int32 {
+	m.unicodeMu.RLock()
+	if id, ok := m.unicodeRunes[r]; ok {
+		m.unicodeMu.RUnlock()
+		return id
+	}
+	m.unicodeMu.RUnlock()
+	bits := make([]byte, (m.unicodeConsumers+7)/8)
+	i := 0
+	for j := range m.inst {
+		inst := &m.inst[j]
+		switch inst.Op {
 		case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-			consumers = append(consumers, &m.inst[i])
-		}
-	}
-	if len(consumers) == 0 || len(consumers) > 8 {
-		return
-	}
-	// Use one bit per consuming instruction: identical signatures are exactly
-	// equivalent for the rune-consuming part of all NFA transitions.
-	signature := func(r rune) uint8 {
-		var bits uint8
-		for i, inst := range consumers {
 			if inst.MatchRune(r) {
-				bits |= 1 << uint(i)
+				bits[i/8] |= byte(1 << uint(i%8))
 			}
+			i++
 		}
-		return bits
 	}
-	bounds := make([]rune, 1, 128)
-	bounds[0] = 128
-	classes := make([]int32, 0, 128)
-	classIDs := make(map[uint8]int32)
-	prior := signature(128)
-	classIDs[prior] = 0
-	classes = append(classes, 0)
-	for r := rune(129); r <= utf8.MaxRune; r++ {
-		current := signature(r)
-		if current == prior {
-			continue
-		}
-		id, ok := classIDs[current]
-		if !ok {
-			id = int32(len(classIDs))
-			classIDs[current] = id
-		}
-		bounds = append(bounds, r)
-		classes = append(classes, id)
-		if len(classes) > 8192 {
-			return
-		} // safe per-rune fallback
-		prior = current
+	signature := string(bits)
+	m.unicodeMu.Lock()
+	defer m.unicodeMu.Unlock()
+	if id, ok := m.unicodeRunes[r]; ok {
+		return id
 	}
-	bounds = append(bounds, utf8.MaxRune+1)
-	m.unicodeBounds = bounds
-	m.unicodeClass = classes
-	m.unicodeClasses = len(classIDs)
+	if m.unicodeRunes == nil {
+		m.unicodeRunes = make(map[rune]int32)
+		m.unicodeSignatures = make(map[string]int32)
+	}
+	id, ok := m.unicodeSignatures[signature]
+	if !ok {
+		id = int32(len(m.unicodeSignatures))
+		m.unicodeSignatures[signature] = id
+		m.unicodeClasses = len(m.unicodeSignatures)
+	}
+	m.unicodeRunes[r] = id
+	return id
+}
+
+func countUnicodeConsumers(insts []syntax.Inst) (n int) {
+	for _, inst := range insts {
+		switch inst.Op {
+		case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			n++
+		}
+	}
+	return n
 }

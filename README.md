@@ -5,8 +5,8 @@
 **Pure Go multi-pattern regular-expression matcher**, without CGO or third-party
 dependencies. Go 1.23+. Patterns use Go/RE2 syntax via `regexp/syntax`.
 Matches a complete input **with substring semantics** (like
-`regexp.Regexp.MatchString`). Captures, spans, streaming across chunks,
-lookarounds and backreferences are not supported.
+`regexp.Regexp.MatchString`), or incrementally across arbitrary byte chunks.
+Captures, match spans, lookarounds and backreferences are not supported.
 
 The project exposes two levels:
 
@@ -74,8 +74,10 @@ ids = set.MatchInto("foobar", ids) // reuse caller-owned buffer
 1. Parse and simplify each pattern using `regexp/syntax` and emit a Thompson
    NFA. Identical programs share instructions; simple literal-only and
    **deterministic literal-prefix + regular-expression-suffix** forms share
-   leading trie instructions. Complex expressions fall back to normal NFA
-   compilation. Pattern IDs are preserved, including duplicates.
+   leading trie instructions. The prefix extractor also handles branches,
+   captures, concatenations, and positive repetition when it can prove a
+   common case-sensitive prefix. Complex expressions that cannot prove such a
+   prefix fall back to ordinary NFA compilation. Pattern IDs are preserved, including duplicates.
 2. Extract a *provably required* ASCII substring where possible. A sparse
    Aho-Corasick automaton emits both a bitmask of candidate NFA/DFA groups
    and **individual candidate Pattern IDs**. Patterns without a required
@@ -87,8 +89,9 @@ ids = set.MatchInto("foobar", ids) // reuse caller-owned buffer
    states. Each state contains consuming instruction PCs and accepting pattern
    IDs; transitions are cached by `(character equivalence class, zero-width
    context)`. NFA start epsilon-closures are memoized by boundary context.
-4. ASCII equivalence classes and conservative Unicode interval classes reduce
-   repeated cached edges. State interning is sharded (32 locks); an adaptive
+4. ASCII equivalence classes and exact folding-aware Unicode classes reduce
+   repeated cached edges. Large Unicode NFAs use an exact lazy
+   signature interner rather than an incomplete eager partition. State interning is sharded (32 locks); an adaptive
    sparse/bitset frontier representation reduces sorting overhead; uncached
    DFA states reuse match-local scratch storage.
 5. `RuleSet` streams distinct accepting pattern IDs into per-rule counters,
@@ -126,11 +129,15 @@ awaiting GC, **and separately compiled `regexp` candidate verifiers** are
 outside that accounting. This is **not a hard heap/RSS memory sandbox**.
 A zero state/transition option selects the default; negative limits fail.
 By default a full cache falls back to correct uncached NFA-derived states.
-With `EvictLRU`, old individual states and their incoming cached transitions
-are removed under synchronization (scanning cached states on an eviction),
-allowing subsequent states to be admitted. Recency tracking is approximate
-under concurrent matches. Eviction can significantly increase contention and
-allocations; it is not a performance guarantee. `ResetCacheOnFull` is a distinct
+With `EvictLRU`, transitions keep **revocable state-ID handles**, not strong
+pointers to target states. A victim is unlinked from the LRU list, intern
+bucket and ID table in **expected O(1)** work; no incoming-edge scan is
+necessary. Stale edges are replaced on access, and eviction detaches the
+victim's entire outgoing map in O(1). Go hash maps and GC do not provide strict
+worst-case O(1) guarantees, and stale edges continue to count against the
+transition budget until reused or their source is evicted. Recency ordering is
+synchronized but can reflect races between concurrent matches. Enabling LRU
+can significantly increase contention; benchmark before using it. `ResetCacheOnFull` is a distinct
 whole-generation policy and should normally not be combined with `EvictLRU`.
 `CacheStats.Evictions` reports evictions in currently retained generations.
 `EvictLRU` and `ResetCacheOnFull` are mutually exclusive to avoid surprising
@@ -196,11 +203,14 @@ go test -fuzz '^FuzzMatchesRegexp$' -fuzztime=30s .
 go test -fuzz '^FuzzRuleSetAgainstRegexp$' -fuzztime=30s .
 ```
 
-Not yet implemented: exact process-heap/RSS caps, O(1) LRU eviction, SIMD,
-full Unicode folding-aware equivalence classes, fully general shared regex
-prefixes, incremental streaming, and nested/field-aware logical expressions.
-Do not interpret the presence of a feature as proof it is faster for all
-workloads. For exact/suffix hostnames, a hash table or reversed-domain trie
+**Still not provided:** exact process-wide heap/RSS limits, regex-language
+minimization for all arbitrary expressions, or SIMD execution of the entire
+NFA/DFA. Implemented here: expected-constant-time LRU unlink using revocable
+handles; exhaustive folding-aware Unicode range partitioning for manageable
+NFAs with exact lazy classes for large ones; AST-aware guaranteed-prefix
+factoring; SSE2 byte search on amd64 plus optimized Go-standard-library byte
+search in the production prefilter; streaming and nested field rules.
+Do not interpret any optimization as proof it is faster on all workloads. For exact/suffix hostnames, a hash table or reversed-domain trie
 can be simpler and faster than a general regex engine.
 
 ## Incremental streaming and field-aware logical rules
@@ -247,13 +257,21 @@ field**, not per rule; cache budgets apply separately to each field.
 For streaming lifetime, examples, operators, Unicode folding behavior,
 correctness tests and benchmarks see [streaming and field-aware rules](docs/STREAMING_FIELDS.md).
 
-### Still out of scope
+## Algorithmic limits of further prefix sharing and SIMD
 
-An O(1) *complete* LRU eviction (including transition cleanup), hand-written
-SIMD multi-pattern kernels, and language-equivalent sharing of *all arbitrary*
-regex prefixes are **not implemented** by this addition. Current `EvictLRU`
-uses a linked list for O(1) recency updates and victim selection, but removing
-incoming/outgoing cached edges still costs O(number of retained edges);
-existing deterministic literal-prefix sharing is not general regex-language
-minimization. The folding-aware Unicode interval optimizer uses an explicit
-compilation work limit and falls back safely for large NFA programs.
+A guaranteed **literal** prefix can be factored out of a regular expression,
+including across alternatives and positive repetitions when the AST proves
+it mandatory. Arbitrary expressions such as `[a-z]+` have no literal prefix;
+merging all *language-equivalent* NFA states would require much more expensive
+automata-equivalence/minimization machinery and can cause exponential state
+blowup. This project shares their lazy DFA **during matching**, but does not
+promise that every regular-language prefix has a compact compile-time
+representation.
+
+The amd64 build includes an independently tested SSE2 `PCMPEQB/PMOVMSKB`
+byte-search kernel. For the AC prefilter's single-common-first-byte rejection,
+the production dispatch uses Go's architecture-optimized `strings.IndexByte`,
+which benchmarked ~3x faster than this hand-written SSE2 kernel on a shared
+AMD EPYC 9V74 machine (4 KB inputs, 100 ms measurements). Other platforms
+use the same standard-library path. Neither case vectorizes the full regex
+state machine. See `BenchmarkSIMDNeedle` and `BenchmarkSSE2Kernel`.
