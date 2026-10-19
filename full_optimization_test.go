@@ -171,3 +171,85 @@ func BenchmarkSIMDNeedle(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkACRootByteVectorReject(b *testing.B) {
+	literal := []string{"host00001.example.com", "host00002.example.com", "host00003.example.com"}
+	normal := newPrefilter(literal)
+	noFast := newPrefilter(literal)
+	noFast.oneRoot = false
+	input := strings.Repeat("x", 4096)
+	for _, tc := range []struct {
+		name string
+		f    *prefilter
+	}{{"SIMD-byte-prescreen", normal}, {"AC-only", noFast}} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			var result bool
+			for i := 0; i < b.N; i++ {
+				result = tc.f.containsAny(input)
+			}
+			benchmarkBool = result
+		})
+	}
+}
+
+func TestSymbolicPrefixSharingDifferential(t *testing.T) {
+	patterns := []string{
+		`(?i:foobar)[0-9]+`, `(?i:foobar)[a-z]+`,
+		`(?:[a-z][0-9])foo`, `(?:[a-z][0-9])bar`,
+		`(?:[a-z]|[a-z])[0-9]`, `(?:[a-z]|[a-z])foo`,
+		`^[a-z]+$`, `^[a-z]{1,3}foo$`,
+		`(?m)^.[a-z]+$`, `(?m)^.foo$`,
+		`(?s).+foo`, `(?s).+bar`,
+		`(?i:k)[a-z]{2,4}`, `(?i:k)\x{212A}`,
+		`\x{FFFD}foo`, `[\p{Han}]+bar`,
+	}
+	set, err := CompileWithOptions(patterns, Options{DisablePrefilter: true, MaxStates: 3, MaxTransitions: 10, EvictLRU: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	regexes := make([]*regexp.Regexp, len(patterns))
+	for i, p := range patterns {
+		regexes[i] = regexp.MustCompile(p)
+	}
+	inputs := []string{"foo", "foobar", "FoObAr99", "FOOBARxyz", "kaaa", "Kka", "éfoo", "\xfffoo", "汉汉bar", "\nfoo", "\nabc", "a1foo", "aafoo", "abcbar", "", "\x00"}
+	rng := rand.New(rand.NewSource(54321))
+	for i := 0; i < 800; i++ {
+		var buf []byte
+		source := []byte("abcdfo012KK汉\n")
+		for j := 0; j < rng.Intn(45); j++ {
+			buf = append(buf, source[rng.Intn(len(source))])
+		}
+		inputs = append(inputs, string(buf))
+	}
+	for _, input := range inputs {
+		var want []int
+		for i, re := range regexes {
+			if re.MatchString(input) {
+				want = append(want, i)
+			}
+		}
+		got := set.MatchIDs(input)
+		if !slices.Equal(want, got) {
+			t.Fatalf("input=%q got=%v want=%v", input, got, want)
+		}
+	}
+}
+
+func TestSymbolicPrefixReducesCompiledPrograms(t *testing.T) {
+	patterns := make([]string, 128)
+	for i := range patterns {
+		patterns[i] = `(?i:abcdef)[a-z]{2}` + string(rune('a'+i%26)) + "[0-9]+"
+	}
+	set, err := CompileWithOptions(patterns, Options{DisablePrefilter: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instructions := 0
+	for _, m := range set.groups {
+		instructions += len(m.inst)
+	}
+	if instructions >= len(patterns)*12 {
+		t.Fatalf("symbolic prefix factoring ineffective: %d instructions", instructions)
+	}
+}

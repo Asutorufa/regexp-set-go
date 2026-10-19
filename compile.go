@@ -26,6 +26,9 @@ func (m *machine) add(id int, tree *syntax.Regexp) error {
 	if used, err := m.addPrefixSuffix(id, tree); used || err != nil {
 		return err
 	}
+	if used, err := m.addSymbolicPrefix(id, tree); used || err != nil {
+		return err
+	}
 	p, err := syntax.Compile(tree)
 	if err != nil {
 		return err
@@ -60,6 +63,7 @@ func (m *machine) add(id int, tree *syntax.Regexp) error {
 
 func (m *machine) finish() {
 	m.finishLiteralTrie()
+	m.finishSymbolicTrie()
 	m.buildASCIIClasses()
 	m.buildUnicodeClasses()
 	n, count := len(m.inst), m.count

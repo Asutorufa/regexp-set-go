@@ -76,8 +76,10 @@ ids = set.MatchInto("foobar", ids) // reuse caller-owned buffer
    **deterministic literal-prefix + regular-expression-suffix** forms share
    leading trie instructions. The prefix extractor also handles branches,
    captures, concatenations, and positive repetition when it can prove a
-   common case-sensitive prefix. Complex expressions that cannot prove such a
-   prefix fall back to ordinary NFA compilation. Pattern IDs are preserved, including duplicates.
+   common case-sensitive prefix. Identical class, wildcard, and case-folded rune prefixes also
+   share symbolic-consuming instructions in an independent trie. Constructs
+   for which no guaranteed prefix can be proven fall back to ordinary NFA
+   compilation. Pattern IDs are preserved, including duplicates.
 2. Extract a *provably required* ASCII substring where possible. A sparse
    Aho-Corasick automaton emits both a bitmask of candidate NFA/DFA groups
    and **individual candidate Pattern IDs**. Patterns without a required
@@ -160,6 +162,8 @@ with `go test -run '^$' -bench ... -benchmem`:
 | `BenchmarkExactCandidates` | Sparse candidate verification vs full shared DFA, miss and hit |
 | `BenchmarkEvictLRU` | Opt-in per-state LRU versus correct uncached fallback |
 | `BenchmarkCompile` | Parsing and automaton construction time |
+| `BenchmarkSIMDNeedle`, `BenchmarkACRootByteVectorReject`, `BenchmarkSSE2Kernel` | Vectorized first-byte filtering against direct AC and standalone SSE2 |
+
 
 ```sh
 go test -run '^$' -bench '^BenchmarkMatch$' -benchmem -benchtime=1s ./...

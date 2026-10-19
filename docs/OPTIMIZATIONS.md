@@ -208,3 +208,24 @@ memory-safety guarantee.
   library `strings.IndexByte` architecture-dispatched implementation. On a
   4 KiB benchmark that implementation outperformed the simple SSE2 version.
   Full automata SIMD/vectorization remains unimplemented.
+
+### Symbolic prefix factoring
+
+The compiler now recognizes guaranteed consuming prefixes that include not
+only literal runes, but also case-folded literal runes, character classes,
+any-rune and any-rune-except-newline atoms. Identical symbolic atoms share a
+prefix trie, with their full regexp suffixes preserved as Thompson programs.
+Alternatives and positive repetition are factored when structural equivalence
+can be proven without changing the matched language. Tests compare thousands
+of sample inputs with Go `regexp`, including anchors and invalid UTF-8.
+
+This expands compile-time sharing considerably but **does not solve arbitrary
+regular-language equivalence**. Unbounded minimization of arbitrary regular
+languages can explode exponentially. The combined lazy DFA continues to
+share reachable matching frontiers at runtime.
+
+A common-first-byte AC precheck has a focused benchmark: on a 4 KiB no-hit
+input consisting entirely of bytes outside the one-byte root, the optimized
+precheck took ~56 ns/op versus ~76,521 ns/op for the full AC scan on one
+Linux/amd64 shared VM (100ms samples). This does not apply when the root has
+multiple outgoing first bytes or the input contains the candidate byte.

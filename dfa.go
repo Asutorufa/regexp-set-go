@@ -41,15 +41,16 @@ type cacheGeneration struct {
 }
 
 type machine struct {
-	inst         []syntax.Inst
-	starts       []uint32
-	matchIDs     []int
-	literalTries map[literalAnchor]*literalNode
-	compiled     map[string][]uint32
-	aliases      map[uint32][]int
-	count        int
-	ruleCount    int
-	prefilter    *prefilter // retained for existing internal/test usage
+	inst          []syntax.Inst
+	starts        []uint32
+	matchIDs      []int
+	literalTries  map[literalAnchor]*literalNode
+	symbolicTries map[literalAnchor]*symbolNode
+	compiled      map[string][]uint32
+	aliases       map[uint32][]int
+	count         int
+	ruleCount     int
+	prefilter     *prefilter // retained for existing internal/test usage
 
 	maxStates, maxTransitions int
 	maxBytes                  int64
