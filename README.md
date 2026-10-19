@@ -2,105 +2,217 @@
 
 [![CI](https://github.com/Asutorufa/regexp-set-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Asutorufa/regexp-set-go/actions/workflows/ci.yml)
 
-Pure Go, no CGO, no third-party dependencies: a multi-pattern
-Go/RE2 regular-expression **existence** matcher returning original rule IDs.
+A **Pure Go multi-pattern regular-expression matcher** for Go/RE2 syntax. It uses `regexp/syntax`, shared Thompson NFAs, and lazily cached DFA states to find which patterns match a string. **No CGO and no third-party dependencies.** Requires Go 1.23+.
 
-## Features
+There are two public matching layers:
 
-- Compile multiple regexes into grouped Thompson NFAs using `regexp/syntax`.
-- Lazily cache DFA states and transitions, with ASCII character equivalence classes.
-- Use a sparse Aho-Corasick **conservative rejection filter** when a required
-  ASCII literal can safely be extracted. Never drop rules that lack such a literal.
-- Retain original zero-based rule IDs, including duplicated pattern strings.
-- Match substrings, Unicode, zero-width assertions and malformed UTF-8 with
-  Go `regexp` semantics.
-- Thread-safe matching via reusable per-call scratch storage.
-- Limit global retained state/transition **counts** and continue correctly
-  when the cache is full. Optional generation reset, disabled by default.
+| API | Purpose | Result |
+| --- | --- | --- |
+| `Compile` / `Set` | Match many individual regular expressions | Zero-based **pattern indexes** (`[]int`) |
+| `CompileRules` / `RuleSet` | Group expressions into priority-ordered logical rules | Application-defined **rule IDs** (`[]uint32`), with AND/OR |
 
-## Usage
+Both layers use the same matching engine; `RuleSet` **does not compile one automaton per rule**.
+
+## Key features
+
+- Compile multiple Go/RE2-compatible regular expressions into shared Thompson NFA instruction arrays.
+- Lazily create and reuse DFA states and transitions; merge equivalent ASCII character classes.
+- Reject clear non-matches with a **conservative** Aho-Corasick required-literal prefilter. Expressions without a provably required literal are never excluded.
+- Return **all matching pattern indexes**, or evaluate **logical rules with AND/OR and explicit priority**.
+- Match anywhere in a complete input string; handle Unicode, zero-width assertions, and malformed UTF-8 consistently with Go's `regexp.Regexp.MatchString` semantics.
+- Reuse caller-supplied result slices and internal `sync.Pool` scratch buffers; compiled matchers support concurrent reads/matches.
+- Apply shared cached-state/transition **count** limits; fall back to uncached matching when full. An optional whole-generation reset is available but **disabled by default**.
+
+## Installation
+
+```sh
+go get github.com/Asutorufa/regexp-set-go
+```
+
+## RuleSet: multiple regexes, multiple priority-ordered rules
+
+Choose `RuleSet` when several patterns belong to the same routing, filtering, or classification rule, and different rules can overlap.
 
 ```go
 package main
 
 import (
     "fmt"
+
     regexpset "github.com/Asutorufa/regexp-set-go"
 )
 
 func main() {
-    set, err := regexpset.Compile([]string{
-        `(?i)ads?\.[a-z]+`,
-        `^tracker\d+\.example\.com$`,
-        `\bmalware\b`,
-    })
+    rules := []regexpset.Rule{
+        {
+            ID:       100,
+            Operator: regexpset.RuleAND,
+            Patterns: []string{`(?i)google`, `\.com$`},
+        },
+        {
+            ID:       50,
+            Operator: regexpset.RuleOR,
+            Patterns: []string{`(?i)github`, `(?i)google`},
+        },
+        {
+            ID:       300,
+            // RuleOR is the default if Operator is omitted.
+            Patterns: []string{`(?i)doubleclick`},
+        },
+    }
+
+    set, err := regexpset.CompileRules(rules)
     if err != nil {
         panic(err)
     }
-    fmt.Println(set.MatchAny("tracker123.example.com")) // true
-    fmt.Println(set.MatchIDs("tracker123.example.com")) // [1]
 
-    dst := make([]int, 0, 8)
-    dst = set.MatchInto("tracker123.example.com", dst)
-    fmt.Println(dst) // [1]
+    id, ok := set.MatchFirstRule("www.google.com")
+    fmt.Println(id, ok) // 100 true
+
+    fmt.Println(set.MatchRuleIDs("www.google.com")) // [100 50]
+    fmt.Println(set.MatchRuleIDs("github.com/doubleclick")) // [50 300]
+
+    dst := make([]uint32, 0, 8)
+    dst = set.MatchRuleIDsInto("www.google.com", dst)
+    fmt.Println(dst) // [100 50]
 }
 ```
 
-Custom cache policy:
+### Rule semantics and priority
+
+- **Priority is input order:** `rules[0]` has the highest priority. It is **not** the numeric `Rule.ID` or the order in which the DFA discovers a match.
+- **`RuleOR` (default):** at least one regex in that rule must match.
+- **`RuleAND`:** every regex in that rule must independently match **somewhere in the same input string**. They do not have to match the same substring or adjacent spans.
+- Different rules can use different operators. `MatchRuleIDs` returns all satisfied IDs in **priority order**, each at most once. `MatchFirstRule` returns the highest-priority satisfied ID and a boolean (IDs may legitimately be zero).
+- Pattern text may be repeated within or across rules; each occurrence counts as an independent pattern. **Rule IDs must be unique**. A rule must contain at least one pattern; unknown operators are rejected.
+- `MatchFirstRule` determines the winning rule **after evaluating matched pattern identities**. It does not stop at the first substring match; doing so would break AND semantics and priority.
+- Grouping is **flat**, one AND or OR operator per rule. Expressions such as `(A OR B) AND (C OR D)`, conditions on different fields (host versus path), actions, and routing are application-level concerns, not built-in `RuleSet` operations.
+
+`RuleSet` also exposes `MatchAny`, `MatchRuleIDsInto`, `Len`, `PatternCount`, `CacheStats`, and `CompileRulesWithOptions`.
+
+For validation details and additional examples, see [RuleSet documentation](docs/RULESET.md).
+
+## RegexSet: original pattern-level API
+
+Use `Set` when callers need zero-based regex indexes rather than logical rule IDs:
 
 ```go
-set, err := regexpset.CompileWithOptions(patterns, regexpset.Options{
-    MaxStates: 8192,
-    MaxTransitions: 131072,
-    DisablePrefilter: false,
-    ResetCacheOnFull: false, // optional; profile before enabling
-})
-if err != nil {
-    // Syntax errors are annotated with their pattern index.
+patterns := []string{
+    `(?i)ads?\.[a-z]+`,
+    `^tracker\d+\.example\.com$`,
+    `\bmalware\b`,
 }
-_ = set.CacheStats()
+set, err := regexpset.Compile(patterns)
+if err != nil {
+    panic(err)
+}
+fmt.Println(set.MatchAny("tracker123.example.com")) // true
+fmt.Println(set.MatchIDs("tracker123.example.com"))  // [1]
+
+dst := make([]int, 0, 8)
+dst = set.MatchInto("tracker123.example.com", dst)
+fmt.Println(dst) // [1]
 ```
 
-The default combined budget is 4,096 cached states and 65,536 transitions.
-Zero means default for public options; it does not mean disable caching.
-`CacheStats` reports entries and ASCII class counts, **not actual memory bytes**.
+`Set.MatchIDs` returns sorted original pattern indexes, including distinct indexes for duplicate patterns. `MatchInto` lets callers reuse a result buffer. Neither layer extracts captures or match spans.
 
-## Limits and semantics
+## Cache configuration
 
-This library reports which expressions match *somewhere* in each complete
-input string, matching `regexp.Regexp.MatchString` for each rule.
-It does not report capture groups, span positions or priority order,
-and does not perform incremental streaming matching. Lookbehind,
-lookahead, backreferences and other unsupported PCRE syntax are not available.
+The same `Options` apply to `CompileWithOptions` and `CompileRulesWithOptions`:
 
-The shared NFA currently concatenates per-regex programs; it does not factor
-all common prefixes at compile time. A positive prefilter result still checks
-the whole eligible group. High-hit input may be **slower** than the unfiltered
-engine. Cache count limits do not bound total memory consumption.
+```go
+opts := regexpset.Options{
+    MaxStates:        8192,
+    MaxTransitions:   131072,
+    DisablePrefilter: false,
+    ResetCacheOnFull: false, // optional: profile carefully before enabling
+}
 
-### Performance caveats
+set, err := regexpset.CompileRulesWithOptions(rules, opts)
+if err != nil {
+    panic(err)
+}
+fmt.Println(set.CacheStats())
+```
 
-This is a developing engine, **not a proven replacement for Hyperscan**.
-On a synthetic warm-cache test with 1,000 anchored domain patterns,
-a prefilter improved negative matches but slowed mixed-hit matches.
-With only a handful of cached states, fallback or repeated resets can be
-hundreds of times slower. See [benchmark methodology](docs/BENCHMARKS.md)
-and [architecture](docs/ARCHITECTURE.md) before selecting a cache policy.
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `MaxStates` | 4,096 | Maximum retained DFA states across the matching groups |
+| `MaxTransitions` | 65,536 | Maximum retained cached transitions |
+| `DisablePrefilter` | `false` | Turn off conservative mandatory-literal rejection |
+| `ResetCacheOnFull` | `false` | Opt into whole-generation cache recycling instead of normal uncached fallback |
 
-For ordinary exact/suffix-domain matching, a hash map or domain trie may
-still be preferable to a general regex engine.
+A zero limit selects its default; negative limits fail compilation. Cache limits count retained entries, **not bytes**, and do **not** cap compiled regex instructions, Aho-Corasick data, concurrent scratch, or transient allocations. Very small caches can cause major slowdowns; a generation reset is not an LRU cache.
 
-## Development
+## Benchmarks
 
-```bash
+This repository includes benchmarks for **both `Set` and `RuleSet`**. The results depend heavily on whether the input matches, the composition of patterns, DFA cache size, and whether all rule IDs must be returned.
+
+### What the benchmarks measure
+
+| Benchmark | Rules / workload | What it compares |
+| --- | --- | --- |
+| `BenchmarkMatch` | 10 / 100 / 1,000 regexes; no-hit and mixed inputs | `MatchAny`, reusable `MatchInto`, and early-exit loop over precompiled Go `regexp` |
+| `BenchmarkMatchIDsOracle` | 1,000 regexes | Return **all** matching indexes versus checking every Go `regexp` |
+| `BenchmarkRuleSet` | 100 / 1,000 / 5,000 logical rules, **3 regexes each**, alternating AND/OR | First matching rule, all matching rules, and separate-regexp **all-rule** baseline (baseline provided through 1,000 rules) |
+| `BenchmarkRuleSetConcurrent` | 500 logical rules | Parallel `MatchFirstRule` with a shared compiled `RuleSet` |
+| `BenchmarkRuleSetTinyCache` | 250 logical rules | RuleSet latency and allocations with only 2 cached states/transitions |
+| `BenchmarkPrefilter` | 1,000 / 10,000 regexes | Mandatory-literal AC prefilter enabled vs disabled, no-hit vs mixed |
+| `BenchmarkCacheBudget` | 1,000 regexes | Default cache, tiny uncached fallback, tiny generation reset |
+| `BenchmarkParallel` | 1,000 regexes | Shared-cache throughput under concurrent `MatchAny` |
+| `BenchmarkCompile` | 10 / 100 / 1,000 regexes | Compilation time and allocations, **separate from match timings** |
+
+`BenchmarkRuleSet`'s synthetic positive sample primarily exercises an OR-rule hit; its AND groups consist of mutually exclusive anchored alternatives. Use a real corpus that has **satisfied AND groups**, overlapping rule matches, and mixed priorities before concluding anything about production routing performance. Compare equivalent work: the separate-regexp **all-rule** baseline is comparable to the all-results operation, **not** directly to `MatchFirstRule`.
+
+### Run the benchmarks
+
+```sh
+# RuleSet: priority, AND/OR grouping, allocations, and conventional regexp baseline
+go test -run '^$' -bench '^BenchmarkRuleSet$' -benchmem -benchtime=1s -count=5 ./...
+
+# RuleSet concurrency and pathological tiny cache
+go test -run '^$' -bench '^BenchmarkRuleSetConcurrent$' -benchmem -cpu=1,2,4,8 ./...
+go test -run '^$' -bench '^BenchmarkRuleSetTinyCache$' -benchmem ./...
+
+# Individual regex existence/all-IDs and compile-time costs
+go test -run '^$' -bench '^(BenchmarkMatch|BenchmarkMatchIDsOracle|BenchmarkCompile)$' -benchmem ./...
+
+# Prefilter and cache behavior
+go test -run '^$' -bench '^(BenchmarkPrefilter|BenchmarkCacheBudget)$' -benchmem ./...
+```
+
+Report **ns/op**, **B/op**, and **allocs/op** together. Matching benchmarks compile expressions outside the timed section and typically **warm the DFA cache**. The input sets are synthetic and often reuse 128 short strings; distinguish throughput on these hot inputs from cold cache, real routing traffic, or large unique input sets. For reliable comparisons, use the same machine and Go version, vary `-cpu`, and capture memory/RSS separately.
+
+### Existing measurement snapshot (illustrative, **not** a performance guarantee)
+
+The figures below are recorded in [benchmark methodology](docs/BENCHMARKS.md) from **October 19, 2026**, on a shared Linux/amd64 AMD EPYC 9V74 machine with **Go 1.23.2**, using `-benchtime=100ms`, synthetic **warm-cache** workloads:
+
+| Workload | Prefilter off | Prefilter on |
+| --- | ---: | ---: |
+| 1,000 regexes, **no match** | 652 ns/op | 489 ns/op |
+| 1,000 regexes, **50% hits** | 712 ns/op | 841 ns/op |
+| 10,000 regexes, **no match** | 659 ns/op | 429 ns/op |
+
+In another 1,000-regex mixed-input run, a normal warm cache measured **790 ns/op**, versus **527,798 ns/op** with tiny uncached fallback and **691,716 ns/op** with repeated tiny-cache resets. Those cases use different cache policies; do not read them as comparable RuleSet numbers or general speedups.
+
+**Interpretation:** the prefilter can help workloads with many non-matches but adds cost when it frequently passes through to the matcher. Cache starvation can erase the benefit of lazy determinization. These samples do **not** prove an advantage over Hyperscan, Rust RegexSet, optimized domain tries, or even another workload on Go's standard library. The RuleSet benchmarks are provided for **local reproduction**, not accompanied here by an unverified published RuleSet performance figure.
+
+For fuller methodology and limitations, see [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Correctness, limitations, and development
+
+The engine implements **existence matching for complete strings**, not capture extraction, match positions, or streaming across chunks. Go's supported regexp syntax does not include PCRE lookbehind, backreferences, or arbitrary lookaround. Untrusted expression sets still need application-level resource limits; a combined lazy DFA can have expensive cold-cache behavior.
+
+For exact or suffix-only domain rules, a hash map or reversed domain trie can be simpler and faster than general regex matching.
+
+```sh
 go test -count=1 ./...
 go test -race -count=1 ./...
 go vet ./...
-go test -run '^$' -bench 'BenchmarkMatch|BenchmarkPrefilter|BenchmarkCacheBudget' -benchmem ./...
-go test -run '^$' -bench 'BenchmarkParallel|BenchmarkMatchIDsOracle' -benchmem ./...
+
+# Fuzz targets are run separately; Go allows one active -fuzz target per run.
 go test -fuzz '^FuzzMatchesRegexp$' -fuzztime=30s .
+go test -fuzz '^FuzzRuleSetAgainstRegexp$' -fuzztime=30s .
 ```
 
-Tests compare rule IDs against Go's standard regexp engine, including
-generated pattern corpora, random inputs, Unicode, invalid UTF-8, AC overlap,
-tiny-cache fallback, optional cache reset and concurrent matching.
+Tests cover Go `regexp` differential checks, invalid UTF-8, Unicode, word/line boundaries, duplicate patterns, AND/OR priority, conservative prefilter behavior, tiny-cache fallback, optional cache reset, and concurrent use. CI runs tests with race detection, vet, cross-compilation, and a benchmark smoke test; smoke tests are **not** stable performance measurements.
