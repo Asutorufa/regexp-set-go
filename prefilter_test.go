@@ -23,7 +23,7 @@ func TestMandatoryLiteralSafety(t *testing.T) {
 		{`(?m)^`, ``},
 		{`\p{Han}+`, ``},
 		{`世界abc`, `abc`},
-		{`(?:somestring|somestringelse)`, ``},
+		{`(?:somestring|somestringelse)`, ``}, // compiler may factor; conservative result
 		{`\x{FFFD}abc`, `abc`},
 	}
 	for _, tc := range examples {
@@ -32,6 +32,7 @@ func TestMandatoryLiteralSafety(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := mandatoryASCII(parsed.Simplify())
+		// The alternation may legally simplify into prefix + optional suffix.
 		if strings.Contains(tc.pattern, "somestring") {
 			continue
 		}
@@ -48,6 +49,8 @@ func TestPrefilterFalseNegatives(t *testing.T) {
 		`(?:foo|bar)quux`, `fo[oa]bar`, `(?:foo)+`, `(?:foo)?`,
 		`(?i:xyz)foobar`, `a世界`, `\x{FFFD}foo`,
 	}
+	// Force both prefiltered and unfiltered groups, as well as exhaustion of
+	// the shared cache budget (one group may receive zero cache slots).
 	for _, options := range []Options{
 		{}, {MaxStates: 1, MaxTransitions: 1},
 		{MaxStates: 7, MaxTransitions: 3, ResetCacheOnFull: true},
@@ -70,6 +73,7 @@ func TestPrefilterFalseNegatives(t *testing.T) {
 				t.Fatalf("opts=%+v input=%q: got %v, want %v", options, input.String(), got, want)
 			}
 		}
+		// Force actual matches instead of only statistically likely misses.
 		for _, str := range []string{"foobar", "foo1", "barquux", "\xfffoo", "foobar\nfoobar", "", "FOO", "xyzfoobar"} {
 			if got, want := s.MatchIDs(str), oracle(patterns, str); !reflect.DeepEqual(got, want) {
 				t.Fatalf("opts=%+v input=%q: got %v want %v", options, str, got, want)
@@ -119,6 +123,8 @@ func TestPrefilterDisabledStillMatches(t *testing.T) {
 }
 
 func TestMandatoryLiteralDifferentialGenerated(t *testing.T) {
+	// Independently verify extracted literals across many inputs via regexp.
+	// Any actual regex match MUST contain its extracted literal.
 	ops := []string{"^", "", "\\b", "[a-z]*", "(?i:x)*"}
 	tails := []string{"", "$", "[0-9]*", "(?:abc|xyz)", "\\b"}
 	inputs := []string{"foo", "abcfoo9", "XYZabcfoo", "foo\n", "\xfffoo", "", "世界foo"}

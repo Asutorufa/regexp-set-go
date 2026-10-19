@@ -30,6 +30,7 @@ func TestASCIIClassesExact(t *testing.T) {
 			}
 		}
 	}
+	// Confirm sharing across an actual cached transition, not just the table.
 	for _, str := range []string{"HELLO123\n", "foobar", "ABC", "___", "012", "世界"} {
 		if got, want := s.MatchIDs(str), oracle(patterns, str); !reflect.DeepEqual(got, want) {
 			t.Fatalf("%q: %v != %v", str, got, want)
@@ -126,6 +127,7 @@ func TestZeroWidthAndInvalidUTF8(t *testing.T) {
 }
 
 func TestMaxIntegerBudget(t *testing.T) {
+	// Large user-specified cache counts must not overflow during partitioning.
 	maxInt := int(^uint(0) >> 1)
 	s, err := CompileWithOptions([]string{`foo`, `.*`, `bar`}, Options{MaxStates: maxInt, MaxTransitions: maxInt})
 	if err != nil {
