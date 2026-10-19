@@ -182,3 +182,50 @@ verifiers, concurrent snapshots and old generations awaiting collection mean
 a precise retained-memory cap would require a different cache allocator. `MaxCacheBytes` bounds only the tracked
 cache reservations described above. Prefer explicit semantics to a false
 memory-safety guarantee.
+
+## Further optimizations (October 2026)
+
+- **Revocable DFA handles:** transitions in the optional per-state LRU store
+  monotonically increasing slot IDs rather than owning pointers. Eviction
+  removes the resident state from the index, slot table and LRU list without
+  scanning incoming references. Expired edge handles are resolved as cache
+  misses, and replaced in place. The core unlink uses expected O(1) Go
+  map/list operations, not strict worst-case timing; incoming stale edge keys
+  occupy the source's accounted edge budget until accessed or evicted.
+- **Complete Unicode fold correctness:** for manageable NFAs, exact interval
+  boundaries incorporate all Unicode SimpleFold cycle members in addition to
+  regexp instruction interval boundaries. Large NFAs use a lazy per-rune
+  signature map, comparing every consuming instruction on first encounter.
+  This preserves class equivalence for *any* Go/RE2 Unicode fold rather than
+  falling back to per-codepoint DFA symbols. The lazy map uses extra process
+  memory outside the tracked DFA budget, so it is not a heap/RSS cap.
+- **Extended guaranteed-prefix factoring:** handles AST concatenation, captures,
+  alternatives with shared literal prefixes, and positive repetitions. It
+  still does not claim expensive general regular-language minimization or
+  equivalent-set merging for arbitrary character-class prefixes.
+- **SIMD prefilter:** an amd64 SSE2 byte-test kernel is supplied and tested;
+  the production common-first-byte prefilter chooses the faster Go standard
+  library `strings.IndexByte` architecture-dispatched implementation. On a
+  4 KiB benchmark that implementation outperformed the simple SSE2 version.
+  Full automata SIMD/vectorization remains unimplemented.
+
+### Symbolic prefix factoring
+
+The compiler now recognizes guaranteed consuming prefixes that include not
+only literal runes, but also case-folded literal runes, character classes,
+any-rune and any-rune-except-newline atoms. Identical symbolic atoms share a
+prefix trie, with their full regexp suffixes preserved as Thompson programs.
+Alternatives and positive repetition are factored when structural equivalence
+can be proven without changing the matched language. Tests compare thousands
+of sample inputs with Go `regexp`, including anchors and invalid UTF-8.
+
+This expands compile-time sharing considerably but **does not solve arbitrary
+regular-language equivalence**. Unbounded minimization of arbitrary regular
+languages can explode exponentially. The combined lazy DFA continues to
+share reachable matching frontiers at runtime.
+
+A common-first-byte AC precheck has a focused benchmark: on a 4 KiB no-hit
+input consisting entirely of bytes outside the one-byte root, the optimized
+precheck took ~56 ns/op versus ~76,521 ns/op for the full AC scan on one
+Linux/amd64 shared VM (100ms samples). This does not apply when the root has
+multiple outgoing first bytes or the input contains the candidate byte.

@@ -1,6 +1,7 @@
 package regexpset
 
 import (
+	"container/list"
 	"regexp/syntax"
 	"sort"
 	"sync"
@@ -17,13 +18,22 @@ type internShard struct {
 	states map[uint64][]*dfaState
 }
 
+// cacheRef stores a stable, non-owning handle for LRU-managed edges. Stale
+// references cannot retain evicted DFA states: slot IDs are never reused.
+type cacheRef struct {
+	state *dfaState // used only when eviction is disabled
+	id    uint64    // nonzero for eviction-enabled generations
+}
+
 type cacheGeneration struct {
 	evictMu   sync.RWMutex // eviction coordinates interns and edge publications
 	memberMu  sync.Mutex
-	members   map[*dfaState]struct{} // only when EvictLRU is enabled
-	clock     atomic.Uint64
+	members   map[*dfaState]*list.Element // only when EvictLRU is enabled
+	lru       list.List                   // front is most recently used, back is victim
 	evictions atomic.Int64
-	initial   sync.Map // syntax.EmptyOp -> *dfaState
+	initial   sync.Map // syntax.EmptyOp -> cacheRef
+	slots     sync.Map // uint64 -> *dfaState, no incoming edges own states
+	nextSlot  atomic.Uint64
 	shards    [internShardCount]internShard
 	states    atomic.Int64
 	edges     atomic.Int64
@@ -31,15 +41,16 @@ type cacheGeneration struct {
 }
 
 type machine struct {
-	inst         []syntax.Inst
-	starts       []uint32
-	matchIDs     []int
-	literalTries map[literalAnchor]*literalNode
-	compiled     map[string][]uint32
-	aliases      map[uint32][]int
-	count        int
-	ruleCount    int
-	prefilter    *prefilter // retained for existing internal/test usage
+	inst          []syntax.Inst
+	starts        []uint32
+	matchIDs      []int
+	literalTries  map[literalAnchor]*literalNode
+	symbolicTries map[literalAnchor]*symbolNode
+	compiled      map[string][]uint32
+	aliases       map[uint32][]int
+	count         int
+	ruleCount     int
+	prefilter     *prefilter // retained for existing internal/test usage
 
 	maxStates, maxTransitions int
 	maxBytes                  int64
@@ -53,6 +64,11 @@ type machine struct {
 	unicodeBounds             []rune
 	unicodeClass              []int32
 	unicodeClasses            int
+	unicodeLazy               bool
+	unicodeConsumers          int
+	unicodeMu                 sync.RWMutex
+	unicodeRunes              map[rune]int32
+	unicodeSignatures         map[string]int32
 
 	startMu    sync.Mutex
 	startCache sync.Map // syntax.EmptyOp -> immutable *dfaState
@@ -65,14 +81,16 @@ type edgeKey struct {
 }
 
 type dfaState struct {
-	ready    []uint32
-	matches  []int
-	cached   bool
-	owner    *cacheGeneration
-	mu       sync.RWMutex
-	edges    map[edgeKey]*dfaState
-	lastUsed atomic.Uint64
-	evicted  atomic.Bool
+	ready       []uint32
+	matches     []int
+	cached      bool
+	owner       *cacheGeneration
+	mu          sync.RWMutex
+	edges       map[edgeKey]cacheRef
+	slot        uint64
+	hashKey     uint64
+	bucketIndex int
+	evicted     atomic.Bool
 }
 
 func newMachine(count, rules, maxStates, maxTransitions int, maxBytes int64, resetOnFull, evictLRU bool) *machine {
@@ -90,10 +108,16 @@ func newMachine(count, rules, maxStates, maxTransitions int, maxBytes int64, res
 
 func (m *machine) cacheStats() CacheStats {
 	g := m.generation.Load()
+	classes := m.unicodeClasses
+	if m.unicodeLazy {
+		m.unicodeMu.RLock()
+		classes = m.unicodeClasses
+		m.unicodeMu.RUnlock()
+	}
 	return CacheStats{
 		States: int(g.states.Load()), Transitions: int(g.edges.Load()),
 		Bytes: g.bytes.Load(), ASCIIClasses: m.asciiClasses,
-		UnicodeClasses: m.unicodeClasses, Resets: int(m.resets.Load()), Evictions: int(g.evictions.Load()),
+		UnicodeClasses: classes, Resets: int(m.resets.Load()), Evictions: int(g.evictions.Load()),
 	}
 }
 
@@ -199,9 +223,10 @@ func (m *machine) begin(next rune, sc *scratch) *dfaState {
 	ctx := syntax.EmptyOpContext(-1, next)
 	g := m.generation.Load()
 	if cached, ok := g.initial.Load(ctx); ok {
-		found := cached.(*dfaState)
-		m.touch(found)
-		return found
+		if found := m.resolve(g, cached.(cacheRef)); found != nil {
+			m.touch(found)
+			return found
+		}
 	}
 	state := m.intern(m.closure(nil, ctx, sc))
 	if state.cached && state.owner == m.generation.Load() {
@@ -210,11 +235,14 @@ func (m *machine) begin(next rune, sc *scratch) *dfaState {
 			g.evictMu.RLock()
 		}
 		if !state.evicted.Load() && g == m.generation.Load() {
-			old, _ := g.initial.LoadOrStore(ctx, state)
+			ref := m.reference(state)
+			// Store replaces a stale handle; any racing reader already
+			// holding a previous state may still complete safely.
+			g.initial.Store(ctx, ref)
 			if m.evictLRU {
 				g.evictMu.RUnlock()
 			}
-			return old.(*dfaState)
+			return state
 		}
 		if m.evictLRU {
 			g.evictMu.RUnlock()
@@ -227,6 +255,9 @@ func (m *machine) symbol(r rune) int32 {
 	if r >= 0 && r < 128 {
 		return int32(m.asciiClass[r])
 	}
+	if m.unicodeLazy {
+		return 128 + m.lazyUnicodeClass(r)
+	}
 	if len(m.unicodeBounds) > 0 {
 		i := sort.Search(len(m.unicodeBounds), func(i int) bool { return m.unicodeBounds[i] > r }) - 1
 		return 128 + m.unicodeClass[i]
@@ -238,11 +269,13 @@ func (m *machine) advance(state *dfaState, r rune, ctx syntax.EmptyOp, sc *scrat
 	key := edgeKey{symbol: m.symbol(r), context: ctx}
 	if state.cached {
 		state.mu.RLock()
-		found := state.edges[key]
+		ref, exists := state.edges[key]
 		state.mu.RUnlock()
-		if found != nil {
-			m.touch(found)
-			return found
+		if exists {
+			if found := m.resolve(state.owner, ref); found != nil {
+				m.touch(found)
+				return found
+			}
 		}
 	}
 	sc.raw = sc.raw[:0]
@@ -261,13 +294,19 @@ func (m *machine) advance(state *dfaState, r rune, ctx syntax.EmptyOp, sc *scrat
 		}
 		if !state.evicted.Load() && !next.evicted.Load() && m.generation.Load() == g {
 			state.mu.Lock()
-			if existing := state.edges[key]; existing != nil {
-				next = existing
+			if existing, ok := state.edges[key]; ok {
+				if resolved := m.resolve(g, existing); resolved != nil {
+					next = resolved
+				} else {
+					// Replace a stale generation-tagged handle in place.
+					// Its edge reservation is already accounted for.
+					state.edges[key] = m.reference(next)
+				}
 			} else if m.reserveEdge(g) {
 				if state.edges == nil {
-					state.edges = make(map[edgeKey]*dfaState)
+					state.edges = make(map[edgeKey]cacheRef)
 				}
-				state.edges[key] = next
+				state.edges[key] = m.reference(next)
 			} else {
 				edgeFull = true
 				if m.resetOnFull && !m.evictLRU && m.maxTransitions > 0 {
@@ -317,18 +356,46 @@ func equalState(a, b *dfaState) bool {
 	return true
 }
 
-// touch updates approximate LRU recency without taking a global lock on the
-// hot transition path. Ties are harmless: eviction only affects performance.
+// reference returns a non-owning slot handle for eviction-enabled states.
+// Outside LRU mode, a direct state pointer avoids the slot-map lookup.
+func (m *machine) reference(state *dfaState) cacheRef {
+	if m.evictLRU {
+		return cacheRef{id: state.slot}
+	}
+	return cacheRef{state: state}
+}
+
+func (m *machine) resolve(g *cacheGeneration, ref cacheRef) *dfaState {
+	if ref.state != nil {
+		return ref.state
+	}
+	if ref.id == 0 {
+		return nil
+	}
+	if value, ok := g.slots.Load(ref.id); ok {
+		return value.(*dfaState)
+	}
+	return nil
+}
+
+// touch maintains exact LRU order with an O(1) linked-list move. This is an
+// synchronized hot-path cost. Incoming transitions hold non-owning slot IDs;
+// an eviction only unlinks the victim itself and never scans other states.
 func (m *machine) touch(state *dfaState) {
 	if !m.evictLRU || !state.cached {
 		return
 	}
-	state.lastUsed.Store(state.owner.clock.Add(1))
+	g := state.owner
+	g.memberMu.Lock()
+	if e := g.members[state]; e != nil {
+		g.lru.MoveToFront(e)
+	}
+	g.memberMu.Unlock()
 }
 
 // intern first attempts a sharded lookup. On cache exhaustion and with opt-in
-// EvictLRU, one old state is removed, including every cached incoming edge.
-// This ensures the intern table never retains state-to-evicted-state pointers.
+// EvictLRU, a victim is removed in expected O(1) without an incoming-edge
+// scan. All incoming transitions use revocable slot handles.
 func (m *machine) intern(candidate *dfaState) *dfaState {
 	if m.maxStates == 0 {
 		return candidate
@@ -356,6 +423,12 @@ func (m *machine) intern(candidate *dfaState) *dfaState {
 				ready:   append([]uint32(nil), candidate.ready...),
 				matches: append([]int(nil), candidate.matches...),
 				cached:  true, owner: g,
+				hashKey:     key,
+				bucketIndex: len(shard.states[key]),
+			}
+			if m.evictLRU {
+				cached.slot = g.nextSlot.Add(1)
+				g.slots.Store(cached.slot, cached)
 			}
 			if shard.states == nil {
 				shard.states = make(map[uint64][]*dfaState)
@@ -364,9 +437,9 @@ func (m *machine) intern(candidate *dfaState) *dfaState {
 			if m.evictLRU {
 				g.memberMu.Lock()
 				if g.members == nil {
-					g.members = make(map[*dfaState]struct{})
+					g.members = make(map[*dfaState]*list.Element)
 				}
-				g.members[cached] = struct{}{}
+				g.members[cached] = g.lru.PushFront(cached)
 				g.memberMu.Unlock()
 			}
 			shard.mu.Unlock()
@@ -394,9 +467,11 @@ func (m *machine) canFitState(state *dfaState) bool {
 	return m.maxBytes <= 0 || stateCost(state) <= m.maxBytes
 }
 
-// evictOne removes the least recently used retained state from the intern
-// table and all other states' cached outgoing transitions. No cache locks are
-// held when calling this method. Readers with transient pointers stay valid.
+// evictOne unlinks one state in expected O(1) map/list operations. Cached
+// incoming edges carry slot IDs, never pointers; a stale slot is treated as
+// a cache miss and replaced lazily. Detaching the outgoing map is O(1), but
+// garbage collection of its allocations is outside the eviction cost model.
+// Go hash-table operations have expected rather than strict worst-case O(1).
 func (m *machine) evictOne(g *cacheGeneration) bool {
 	g.evictMu.Lock()
 	defer g.evictMu.Unlock()
@@ -404,60 +479,38 @@ func (m *machine) evictOne(g *cacheGeneration) bool {
 		return false
 	}
 	g.memberMu.Lock()
-	var victim *dfaState
-	var oldest uint64 = ^uint64(0)
-	for st := range g.members {
-		if tick := st.lastUsed.Load(); tick < oldest {
-			victim, oldest = st, tick
-		}
-	}
-	if victim == nil {
+	tail := g.lru.Back()
+	if tail == nil {
 		g.memberMu.Unlock()
 		return false
 	}
+	victim := tail.Value.(*dfaState)
+	g.lru.Remove(tail)
 	delete(g.members, victim)
 	victim.evicted.Store(true)
-	others := make([]*dfaState, 0, len(g.members))
-	for st := range g.members {
-		others = append(others, st)
-	}
 	g.memberMu.Unlock()
 
-	key := hashState(victim)
-	shard := &g.shards[int(key%internShardCount)]
+	// Remove ownership before any new lookup can resolve this slot.
+	g.slots.Delete(victim.slot)
+	shard := &g.shards[int(victim.hashKey%internShardCount)]
 	shard.mu.Lock()
-	bucket := shard.states[key]
-	for i, st := range bucket {
-		if st == victim {
-			bucket = append(bucket[:i], bucket[i+1:]...)
-			break
-		}
+	bucket := shard.states[victim.hashKey]
+	last := len(bucket) - 1
+	if victim.bucketIndex != last {
+		moved := bucket[last]
+		bucket[victim.bucketIndex] = moved
+		moved.bucketIndex = victim.bucketIndex
 	}
-	if len(bucket) == 0 {
-		delete(shard.states, key)
+	bucket[last] = nil
+	if last == 0 {
+		delete(shard.states, victim.hashKey)
 	} else {
-		shard.states[key] = bucket
+		shard.states[victim.hashKey] = bucket[:last]
 	}
 	shard.mu.Unlock()
-	g.initial.Range(func(k, v any) bool {
-		if v == victim {
-			g.initial.Delete(k)
-		}
-		return true
-	})
-	var removed int64
-	for _, st := range others {
-		st.mu.Lock()
-		for k, to := range st.edges {
-			if to == victim {
-				delete(st.edges, k)
-				removed++
-			}
-		}
-		st.mu.Unlock()
-	}
+
 	victim.mu.Lock()
-	removed += int64(len(victim.edges))
+	removed := int64(len(victim.edges))
 	victim.edges = nil
 	victim.mu.Unlock()
 	g.states.Add(-1)

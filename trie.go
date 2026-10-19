@@ -55,29 +55,23 @@ func literalShape(tree *syntax.Regexp) ([]rune, literalAnchor, bool) {
 // prefix is factored, so repeats/alternations/zero-width suffixes keep their
 // standard semantics. Alternations at the top level are not transformed.
 func regexPrefixShape(tree *syntax.Regexp) ([]rune, literalAnchor, *syntax.Regexp, bool) {
-	if tree.Op != syntax.OpConcat || len(tree.Sub) < 2 {
-		return nil, literalAnchor{}, nil, false
-	}
-	sub := tree.Sub
+	source := tree
 	anchor := literalAnchor{}
-	switch sub[0].Op {
-	case syntax.OpBeginText:
-		anchor.begin = syntax.EmptyBeginText
-		sub = sub[1:]
-	case syntax.OpBeginLine:
-		anchor.begin = syntax.EmptyBeginLine
-		sub = sub[1:]
+	if tree.Op == syntax.OpConcat && len(tree.Sub) > 1 {
+		switch tree.Sub[0].Op {
+		case syntax.OpBeginText:
+			anchor.begin = syntax.EmptyBeginText
+			source = concatRegex(tree.Sub[1:]...)
+		case syntax.OpBeginLine:
+			anchor.begin = syntax.EmptyBeginLine
+			source = concatRegex(tree.Sub[1:]...)
+		}
 	}
-	if len(sub) < 2 || sub[0].Op != syntax.OpLiteral || sub[0].Flags&syntax.FoldCase != 0 || len(sub[0].Rune) < 2 || len(sub[0].Rune) > 4096 {
+	prefix, suffix := splitGuaranteedPrefix(source)
+	if len(prefix) < 2 || len(prefix) > 4096 {
 		return nil, anchor, nil, false
 	}
-	var tail *syntax.Regexp
-	if len(sub) == 2 {
-		tail = sub[1]
-	} else {
-		tail = (&syntax.Regexp{Op: syntax.OpConcat, Sub: append([]*syntax.Regexp(nil), sub[1:]...)}).Simplify()
-	}
-	return sub[0].Rune, anchor, tail, true
+	return prefix, anchor, suffix, true
 }
 
 // addPrefixSuffix shares the leading literal trie but keeps the full suffix
