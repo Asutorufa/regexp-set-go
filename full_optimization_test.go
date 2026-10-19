@@ -109,13 +109,19 @@ func TestLRURevocableHandlesAndBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Compile the independent oracle once, so the timed stress loop tests
+	// eviction and matching rather than 90,000 regexp compilations.
+	oracle := make([]*regexp.Regexp, len(patterns))
+	for i, expression := range patterns {
+		oracle[i] = regexp.MustCompile(expression)
+	}
 	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < 900; i++ {
 		sample := strings.Repeat("a", rng.Intn(24)) + "entry" + strings.Repeat("a", rng.Intn(17)) + "42z"
 		got := set.MatchIDs(sample)
 		var want []int
-		for id, p := range patterns {
-			if regexp.MustCompile(p).MatchString(sample) {
+		for id, re := range oracle {
+			if re.MatchString(sample) {
 				want = append(want, id)
 			}
 		}
