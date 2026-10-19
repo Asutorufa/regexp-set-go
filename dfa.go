@@ -18,11 +18,16 @@ type internShard struct {
 }
 
 type cacheGeneration struct {
-	initial sync.Map // syntax.EmptyOp -> *dfaState
-	shards  [internShardCount]internShard
-	states  atomic.Int64
-	edges   atomic.Int64
-	bytes   atomic.Int64 // tracked state/edge reservations (not full process RSS)
+	evictMu   sync.RWMutex // eviction coordinates interns and edge publications
+	memberMu  sync.Mutex
+	members   map[*dfaState]struct{} // only when EvictLRU is enabled
+	clock     atomic.Uint64
+	evictions atomic.Int64
+	initial   sync.Map // syntax.EmptyOp -> *dfaState
+	shards    [internShardCount]internShard
+	states    atomic.Int64
+	edges     atomic.Int64
+	bytes     atomic.Int64 // tracked state/edge reservations (not full process RSS)
 }
 
 type machine struct {
@@ -39,6 +44,7 @@ type machine struct {
 	maxStates, maxTransitions int
 	maxBytes                  int64
 	resetOnFull               bool
+	evictLRU                  bool
 	resets                    atomic.Int64
 	generation                atomic.Pointer[cacheGeneration]
 	resetMu                   sync.Mutex
@@ -59,19 +65,22 @@ type edgeKey struct {
 }
 
 type dfaState struct {
-	ready   []uint32
-	matches []int
-	cached  bool
-	owner   *cacheGeneration
-	mu      sync.RWMutex
-	edges   map[edgeKey]*dfaState
+	ready    []uint32
+	matches  []int
+	cached   bool
+	owner    *cacheGeneration
+	mu       sync.RWMutex
+	edges    map[edgeKey]*dfaState
+	lastUsed atomic.Uint64
+	evicted  atomic.Bool
 }
 
-func newMachine(count, rules, maxStates, maxTransitions int, maxBytes int64, resetOnFull bool) *machine {
+func newMachine(count, rules, maxStates, maxTransitions int, maxBytes int64, resetOnFull, evictLRU bool) *machine {
 	m := &machine{
 		count: count, ruleCount: rules, maxStates: maxStates,
 		maxTransitions: maxTransitions, maxBytes: maxBytes,
 		resetOnFull: resetOnFull,
+		evictLRU:    evictLRU,
 		compiled:    make(map[string][]uint32),
 		aliases:     make(map[uint32][]int),
 	}
@@ -84,7 +93,7 @@ func (m *machine) cacheStats() CacheStats {
 	return CacheStats{
 		States: int(g.states.Load()), Transitions: int(g.edges.Load()),
 		Bytes: g.bytes.Load(), ASCIIClasses: m.asciiClasses,
-		UnicodeClasses: m.unicodeClasses, Resets: int(m.resets.Load()),
+		UnicodeClasses: m.unicodeClasses, Resets: int(m.resets.Load()), Evictions: int(g.evictions.Load()),
 	}
 }
 
@@ -190,12 +199,26 @@ func (m *machine) begin(next rune, sc *scratch) *dfaState {
 	ctx := syntax.EmptyOpContext(-1, next)
 	g := m.generation.Load()
 	if cached, ok := g.initial.Load(ctx); ok {
-		return cached.(*dfaState)
+		found := cached.(*dfaState)
+		m.touch(found)
+		return found
 	}
 	state := m.intern(m.closure(nil, ctx, sc))
 	if state.cached && state.owner == m.generation.Load() {
-		old, _ := state.owner.initial.LoadOrStore(ctx, state)
-		return old.(*dfaState)
+		g := state.owner
+		if m.evictLRU {
+			g.evictMu.RLock()
+		}
+		if !state.evicted.Load() && g == m.generation.Load() {
+			old, _ := g.initial.LoadOrStore(ctx, state)
+			if m.evictLRU {
+				g.evictMu.RUnlock()
+			}
+			return old.(*dfaState)
+		}
+		if m.evictLRU {
+			g.evictMu.RUnlock()
+		}
 	}
 	return state
 }
@@ -218,6 +241,7 @@ func (m *machine) advance(state *dfaState, r rune, ctx syntax.EmptyOp, sc *scrat
 		found := state.edges[key]
 		state.mu.RUnlock()
 		if found != nil {
+			m.touch(found)
 			return found
 		}
 	}
@@ -231,19 +255,35 @@ func (m *machine) advance(state *dfaState, r rune, ctx syntax.EmptyOp, sc *scrat
 	next := m.intern(m.closure(sc.raw, ctx, sc))
 	if state.cached && next.cached && state.owner == next.owner && state.owner == m.generation.Load() {
 		g := state.owner
-		state.mu.Lock()
-		if existing := state.edges[key]; existing != nil {
-			next = existing
-		} else if m.reserveEdge(g) {
-			if state.edges == nil {
-				state.edges = make(map[edgeKey]*dfaState)
-			}
-			state.edges[key] = next
-		} else if m.resetOnFull && m.maxTransitions > 0 {
-			m.resetGeneration(g)
+		edgeFull := false
+		if m.evictLRU {
+			g.evictMu.RLock()
 		}
-		state.mu.Unlock()
+		if !state.evicted.Load() && !next.evicted.Load() && m.generation.Load() == g {
+			state.mu.Lock()
+			if existing := state.edges[key]; existing != nil {
+				next = existing
+			} else if m.reserveEdge(g) {
+				if state.edges == nil {
+					state.edges = make(map[edgeKey]*dfaState)
+				}
+				state.edges[key] = next
+			} else {
+				edgeFull = true
+				if m.resetOnFull && !m.evictLRU && m.maxTransitions > 0 {
+					m.resetGeneration(g)
+				}
+			}
+			state.mu.Unlock()
+		}
+		if m.evictLRU {
+			g.evictMu.RUnlock()
+			if edgeFull {
+				m.evictOne(g)
+			} // create room for a future edge
+		}
 	}
+	m.touch(next)
 	return next
 }
 
@@ -277,41 +317,154 @@ func equalState(a, b *dfaState) bool {
 	return true
 }
 
-// The shard lock covers only states whose hashes map to that shard. No global
-// mutex is acquired on an intern hit or when reserving a fresh state.
+// touch updates approximate LRU recency without taking a global lock on the
+// hot transition path. Ties are harmless: eviction only affects performance.
+func (m *machine) touch(state *dfaState) {
+	if !m.evictLRU || !state.cached {
+		return
+	}
+	state.lastUsed.Store(state.owner.clock.Add(1))
+}
+
+// intern first attempts a sharded lookup. On cache exhaustion and with opt-in
+// EvictLRU, one old state is removed, including every cached incoming edge.
+// This ensures the intern table never retains state-to-evicted-state pointers.
 func (m *machine) intern(candidate *dfaState) *dfaState {
 	if m.maxStates == 0 {
 		return candidate
 	}
-	g := m.generation.Load()
 	key := hashState(candidate)
-	shard := &g.shards[int(key%internShardCount)]
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	for _, existing := range shard.states[key] {
-		if equalState(candidate, existing) {
-			return existing
+	for attempt := 0; ; attempt++ {
+		g := m.generation.Load()
+		if m.evictLRU {
+			g.evictMu.RLock()
 		}
-	}
-	if !m.reserveState(g, candidate) {
+		shard := &g.shards[int(key%internShardCount)]
+		shard.mu.Lock()
+		for _, existing := range shard.states[key] {
+			if equalState(candidate, existing) {
+				shard.mu.Unlock()
+				if m.evictLRU {
+					g.evictMu.RUnlock()
+				}
+				m.touch(existing)
+				return existing
+			}
+		}
+		if m.reserveState(g, candidate) {
+			cached := &dfaState{
+				ready:   append([]uint32(nil), candidate.ready...),
+				matches: append([]int(nil), candidate.matches...),
+				cached:  true, owner: g,
+			}
+			if shard.states == nil {
+				shard.states = make(map[uint64][]*dfaState)
+			}
+			shard.states[key] = append(shard.states[key], cached)
+			if m.evictLRU {
+				g.memberMu.Lock()
+				if g.members == nil {
+					g.members = make(map[*dfaState]struct{})
+				}
+				g.members[cached] = struct{}{}
+				g.memberMu.Unlock()
+			}
+			shard.mu.Unlock()
+			if m.evictLRU {
+				g.evictMu.RUnlock()
+			}
+			m.touch(cached)
+			return cached
+		}
+		shard.mu.Unlock()
+		if m.evictLRU {
+			g.evictMu.RUnlock()
+		}
+		if m.evictLRU && g == m.generation.Load() && attempt < m.maxStates && m.canFitState(candidate) && m.evictOne(g) {
+			continue
+		}
 		if m.resetOnFull {
 			m.resetGeneration(g)
 		}
 		return candidate
 	}
-	// Candidate may be backed by a reusable call-local scratch object.
-	// Publish a deep copy: cached states must never alias transient scratch.
-	cached := &dfaState{
-		ready:   append([]uint32(nil), candidate.ready...),
-		matches: append([]int(nil), candidate.matches...),
-		cached:  true,
-		owner:   g,
+}
+
+func (m *machine) canFitState(state *dfaState) bool {
+	return m.maxBytes <= 0 || stateCost(state) <= m.maxBytes
+}
+
+// evictOne removes the least recently used retained state from the intern
+// table and all other states' cached outgoing transitions. No cache locks are
+// held when calling this method. Readers with transient pointers stay valid.
+func (m *machine) evictOne(g *cacheGeneration) bool {
+	g.evictMu.Lock()
+	defer g.evictMu.Unlock()
+	if m.generation.Load() != g {
+		return false
 	}
-	if shard.states == nil {
-		shard.states = make(map[uint64][]*dfaState)
+	g.memberMu.Lock()
+	var victim *dfaState
+	var oldest uint64 = ^uint64(0)
+	for st := range g.members {
+		if tick := st.lastUsed.Load(); tick < oldest {
+			victim, oldest = st, tick
+		}
 	}
-	shard.states[key] = append(shard.states[key], cached)
-	return cached
+	if victim == nil {
+		g.memberMu.Unlock()
+		return false
+	}
+	delete(g.members, victim)
+	victim.evicted.Store(true)
+	others := make([]*dfaState, 0, len(g.members))
+	for st := range g.members {
+		others = append(others, st)
+	}
+	g.memberMu.Unlock()
+
+	key := hashState(victim)
+	shard := &g.shards[int(key%internShardCount)]
+	shard.mu.Lock()
+	bucket := shard.states[key]
+	for i, st := range bucket {
+		if st == victim {
+			bucket = append(bucket[:i], bucket[i+1:]...)
+			break
+		}
+	}
+	if len(bucket) == 0 {
+		delete(shard.states, key)
+	} else {
+		shard.states[key] = bucket
+	}
+	shard.mu.Unlock()
+	g.initial.Range(func(k, v any) bool {
+		if v == victim {
+			g.initial.Delete(k)
+		}
+		return true
+	})
+	var removed int64
+	for _, st := range others {
+		st.mu.Lock()
+		for k, to := range st.edges {
+			if to == victim {
+				delete(st.edges, k)
+				removed++
+			}
+		}
+		st.mu.Unlock()
+	}
+	victim.mu.Lock()
+	removed += int64(len(victim.edges))
+	victim.edges = nil
+	victim.mu.Unlock()
+	g.states.Add(-1)
+	g.edges.Add(-removed)
+	g.bytes.Add(-stateCost(victim) - removed*edgeBudgetBytes)
+	g.evictions.Add(1)
+	return true
 }
 
 func reserve(limit int64, count *atomic.Int64, delta int64) bool {
@@ -329,13 +482,17 @@ func reserve(limit int64, count *atomic.Int64, delta int64) bool {
 	}
 }
 
+func stateCost(state *dfaState) int64 {
+	return int64(unsafe.Sizeof(dfaState{})) + int64(len(state.ready))*4 + int64(len(state.matches))*int64(unsafe.Sizeof(int(0))) + 64
+}
+
 func (m *machine) reserveState(g *cacheGeneration, state *dfaState) bool {
 	if m.maxBytes < 0 || !reserve(int64(m.maxStates), &g.states, 1) {
 		return false
 	}
-	// Tracked memory is an estimated upper accounting of state objects, their
-	// slices, and map-related overhead; Go maps/pools/GC are not in this budget.
-	cost := int64(unsafe.Sizeof(dfaState{})) + int64(len(state.ready))*4 + int64(len(state.matches))*int64(unsafe.Sizeof(int(0))) + 64
+	// Account the state object, frontier slice allocations, and a fixed
+	// map/allocator allowance. This is not a Go heap/RSS measurement.
+	cost := stateCost(state)
 	if m.maxBytes > 0 && !reserve(m.maxBytes, &g.bytes, cost) {
 		g.states.Add(-1)
 		return false

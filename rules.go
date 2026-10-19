@@ -139,18 +139,24 @@ func (s *RuleSet) MatchFirstRule(input string) (uint32, bool) {
 	if len(s.rules) == 0 {
 		return 0, false
 	}
-	candidates := s.set.candidateMask(input)
+	var exact *candidateScratch
+	candidates := ^uint64(0)
+	if s.set.candidates != nil {
+		exact = s.set.candidates.candidatePatterns(input)
+		defer s.set.candidates.releaseCandidates(exact)
+		candidates = exact.groups
+	}
 	sc := s.pool.Get().(*ruleScratch)
 	defer s.release(sc)
 	// Defer looking for the earliest viable rule until a rule actually
 	// matches. No-match workloads avoid scanning all logical rules here.
 	earliest := -1
-	s.countMatchesWithMask(sc, input, candidates, func(index int) bool {
+	s.countMatchesWithCandidates(sc, input, candidates, exact, func(index int) bool {
 		if !s.satisfied(index, sc.hits[index]) {
 			return false
 		}
 		if earliest == -1 {
-			earliest = s.firstPossibleRule(candidates)
+			earliest = s.firstPossibleRuleExact(candidates, exact)
 		}
 		return earliest == index
 	})
@@ -189,9 +195,39 @@ func (s *RuleSet) rulePossible(index int, candidates uint64) bool {
 }
 
 func (s *RuleSet) firstPossibleRule(candidates uint64) int {
-	for index := range s.rules {
-		if s.rulePossible(index, candidates) {
-			return index
+	return s.firstPossibleRuleExact(candidates, nil)
+}
+
+// An AC-disqualified individual pattern is impossible, even when some other
+// pattern in its shared DFA machine has a candidate literal in the input.
+func (s *RuleSet) firstPossibleRuleExact(mask uint64, exact *candidateScratch) int {
+	for i, rule := range s.rules {
+		possible := func(p int) bool {
+			if s.set.patternGroupBits[p] == 0 {
+				return true
+			}
+			if exact != nil {
+				return exact.seen[p]
+			}
+			return mask&s.set.patternGroupBits[p] != 0
+		}
+		if rule.operator == RuleAND {
+			ok := true
+			for p := rule.firstPattern; p < rule.firstPattern+rule.patterns; p++ {
+				if !possible(p) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return i
+			}
+		} else {
+			for p := rule.firstPattern; p < rule.firstPattern+rule.patterns; p++ {
+				if possible(p) {
+					return i
+				}
+			}
 		}
 	}
 	return len(s.rules)
@@ -243,7 +279,10 @@ func (s *RuleSet) countMatchesUntil(sc *ruleScratch, input string, stop func(int
 }
 
 func (s *RuleSet) countMatchesWithMask(sc *ruleScratch, input string, candidates uint64, stop func(int) bool) {
-	s.set.visitWithMask(input, candidates, func(patternID int) bool {
+	s.countMatchesWithCandidates(sc, input, candidates, nil, stop)
+}
+func (s *RuleSet) countMatchesWithCandidates(sc *ruleScratch, input string, candidates uint64, exact *candidateScratch, stop func(int) bool) {
+	s.set.visitWithCandidates(input, candidates, exact, func(patternID int) bool {
 		index := s.patternToRule[patternID]
 		if sc.hits[index] == 0 {
 			sc.touched = append(sc.touched, index)

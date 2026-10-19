@@ -3,6 +3,7 @@ package regexpset
 import (
 	"regexp/syntax"
 	"strings"
+	"sync"
 )
 
 // mandatoryASCII returns a byte string present in *every* match of r, or "".
@@ -75,11 +76,22 @@ func mandatoryASCII(r *syntax.Regexp) string {
 // links inherit outputs so overlapping/contained literals are never missed.
 // A bit identifies a whole regex group, not a particular regex: the group
 // still verifies matches using its full NFA/DFA.
-type prefilter struct{ nodes []acNode }
+type prefilter struct {
+	nodes        []acNode
+	pool         sync.Pool
+	patternCount int
+}
+type candidateScratch struct {
+	groups uint64
+	seen   []bool
+	ids    []int
+}
 type acNode struct {
-	next   map[byte]int
-	fail   int
-	output uint64
+	next       map[byte]int
+	fail       int
+	output     uint64
+	ids        []int
+	outputLink int // nearest failure ancestor with terminal pattern IDs
 }
 
 // newPrefilter preserves the simple existence matcher for callers/tests.
@@ -90,7 +102,12 @@ func newPrefilter(literals []string) *prefilter {
 
 // groups maps each mandatory literal to its candidate-machine index [0, 63].
 func newPrefilterGroups(literals []string, groups []int) *prefilter {
-	f := &prefilter{nodes: []acNode{{}}}
+	return newPrefilterPatterns(literals, groups, nil, 0)
+}
+
+func newPrefilterPatterns(literals []string, groups, patterns []int, patternCount int) *prefilter {
+	f := &prefilter{nodes: []acNode{{}}, patternCount: patternCount}
+	f.pool.New = func() any { return &candidateScratch{seen: make([]bool, patternCount)} }
 	for i, lit := range literals {
 		at := 0
 		for j := 0; j < len(lit); j++ {
@@ -107,6 +124,9 @@ func newPrefilterGroups(literals []string, groups []int) *prefilter {
 			at = child
 		}
 		f.nodes[at].output |= uint64(1) << uint(groups[i])
+		if patterns != nil {
+			f.nodes[at].ids = append(f.nodes[at].ids, patterns[i])
+		}
 	}
 	queue := make([]int, 0, len(f.nodes))
 	for _, child := range f.nodes[0].next {
@@ -126,6 +146,12 @@ func newPrefilterGroups(literals []string, groups []int) *prefilter {
 				f.nodes[child].fail = dest
 			}
 			f.nodes[child].output |= f.nodes[f.nodes[child].fail].output
+			ancestor := f.nodes[child].fail
+			if len(f.nodes[ancestor].ids) > 0 {
+				f.nodes[child].outputLink = ancestor
+			} else {
+				f.nodes[child].outputLink = f.nodes[ancestor].outputLink
+			}
 			queue = append(queue, child)
 		}
 	}
@@ -154,4 +180,43 @@ func (f *prefilter) candidateGroups(input string) uint64 {
 
 func (f *prefilter) containsAny(input string) bool {
 	return f.candidateGroups(input) != 0
+}
+
+// candidatePatterns collects exact *necessary* regex candidates. A candidate
+// still needs regex verification. The caller must release the scratch.
+func (f *prefilter) candidatePatterns(input string) *candidateScratch {
+	sc := f.pool.Get().(*candidateScratch)
+	sc.ids = sc.ids[:0]
+	sc.groups = 0
+	at := 0
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+		next, found := f.nodes[at].next[ch]
+		for !found && at != 0 {
+			at = f.nodes[at].fail
+			next, found = f.nodes[at].next[ch]
+		}
+		if found {
+			at = next
+		} else {
+			at = 0
+		}
+		sc.groups |= f.nodes[at].output
+		for n := at; n != 0; n = f.nodes[n].outputLink {
+			for _, id := range f.nodes[n].ids {
+				if !sc.seen[id] {
+					sc.seen[id] = true
+					sc.ids = append(sc.ids, id)
+				}
+			}
+		}
+	}
+	return sc
+}
+func (f *prefilter) releaseCandidates(sc *candidateScratch) {
+	for _, id := range sc.ids {
+		sc.seen[id] = false
+	}
+	sc.ids = sc.ids[:0]
+	f.pool.Put(sc)
 }

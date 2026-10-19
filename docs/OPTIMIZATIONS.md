@@ -15,8 +15,11 @@ performance. The matcher remains pure Go and requires no external packages.
    up to 16 groups, approximately 512 patterns per group. An AC scan identifies
    which groups could match; the others are skipped. This is intentionally
    conservative: any match contains its required literal, and every pattern
-   is assigned to exactly one candidate group. Filters return *groups*, **not
-   individual candidate pattern IDs**. This avoids needing candidate-dependent
+   is assigned to exactly one candidate group. AC also collects individual pattern IDs. On sparse input (at most 16
+   candidates and at most 1/8 of the eligible patterns), their independently
+   compiled Go regexes verify exact matches. Dense input falls back to the
+   shared DFA. This intentionally duplicates verifier memory outside the DFA
+   budget. This avoids needing candidate-dependent
    DFA states or separate machine instances for every input bitmap. Set
    `DisableCandidateShards: true` to use a single eligible group instead.
 2. **Memoized NFA start closures (nfa.go).** The epsilon closure of each
@@ -84,8 +87,9 @@ RuleSet does **not** store mutable AND counters in immutable DFA states.
 Those counters depend on the entire input prefix and would make the state
 space explode if included in the DFA identity. Pooled match-local scratch
 stores counters instead. The proof is conservative and only excludes rules whose necessary AC
-pattern group is absent. More precise per-pattern candidate filtering and
-nested AND/OR ASTs remain future work.
+pattern group is absent. Per-pattern AC candidate presence now also proves a higher-priority AND
+requirement impossible when its mandatory substring is absent. Nested AND/OR
+ASTs remain future work.
 
 ## Usage
 
@@ -96,6 +100,8 @@ set, err := regexpset.CompileRulesWithOptions(rules, regexpset.Options{
     MaxCacheBytes:          16 << 20, // approximate retained state/edge budget
     DisableCandidateShards: false,
     ResetCacheOnFull:       false,
+    DisableExactCandidates: false,
+    EvictLRU:              false, // opt-in; benchmark before enabling
 })
 if err != nil { panic(err) }
 
@@ -126,11 +132,13 @@ The unfiltered baseline benefits from a larger shared cache. Use the
 Compare *matching the first result* against first-result baselines, and
 *returning all matching IDs* against all-result baselines.
 
-The performance-critical remaining work includes dynamic candidate-dependent
-start-state caching without losing correctness, byte-exact cache allocation
-management, adaptive eviction of individual DFA states (instead of
-whole-generation reset), general regex-prefix factoring, and additional
-workload-specific fast paths. These are not claimed by this implementation.
+Opt-in per-state LRU is now available. It selects the least recently used
+retained state by an atomic recency stamp and removes incoming edges before
+reclaiming accounting reservations; eviction scans retained states and can
+therefore cost O(states + edges). Additional work remains: byte-exact Go heap
+allocation management (not possible with current maps/GC accounting), O(1)
+recency eviction, dynamic candidate-dependent start-state caching without
+state explosion, general regex-prefix factoring, and workload fast paths. These are not claimed by this implementation.
 
 ## Validation
 
@@ -168,9 +176,9 @@ cheap when the first rule succeeds. For routing work with a very hot first
 rule, consider a specialized fast path or smaller ordered tiers before the
 shared matcher. For large no-match corpora, prefiltering remains valuable.
 
-This release deliberately does not promise byte-exact Go heap limits or a
-fully adaptive per-state LRU: concurrent snapshots, map bucket overhead and
-old generations awaiting collection mean a precise retained-memory cap would
-require a different cache allocator. `MaxCacheBytes` bounds only the tracked
+This release deliberately does not promise byte-exact Go heap limits or
+constant-time LRU: Go map bucket overhead, independently compiled Go regex
+verifiers, concurrent snapshots and old generations awaiting collection mean
+a precise retained-memory cap would require a different cache allocator. `MaxCacheBytes` bounds only the tracked
 cache reservations described above. Prefer explicit semantics to a false
 memory-safety guarantee.
