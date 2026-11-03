@@ -59,7 +59,6 @@ type Set struct {
 	patternGroupBits []uint64         // one safe necessary candidate bit per pattern (0: unconditional)
 	exactPatterns    []*regexp.Regexp // compiled verifier for safe eligible-pattern candidates
 	exactEligible    int
-	disableExact     bool
 }
 
 // Compile compiles patterns using bounded caches and safe literal prefiltering.
@@ -97,7 +96,7 @@ func CompileWithOptions(patterns []string, opts Options) (*Set, error) {
 			eligible = append(eligible, p)
 		}
 	}
-	result := &Set{count: len(patterns), patternGroupBits: make([]uint64, len(patterns)), disableExact: opts.DisableExactCandidates}
+	result := &Set{count: len(patterns), patternGroupBits: make([]uint64, len(patterns))}
 	var gs []patternGroup
 	if len(regular) > 0 {
 		gs = append(gs, patternGroup{patterns: regular})
@@ -141,12 +140,21 @@ func CompileWithOptions(patterns []string, opts Options) (*Set, error) {
 		}
 		result.candidates = newPrefilterPatterns(literals, assigned, ids, len(patterns))
 		result.exactEligible = len(eligible)
-		if !opts.DisableExactCandidates {
+		// A single candidate needs at least eight eligible patterns to pass
+		// the sparsity threshold. Smaller sets never use these verifiers.
+		if !opts.DisableExactCandidates && len(eligible) >= 8 {
 			result.exactPatterns = make([]*regexp.Regexp, len(patterns))
+			verifiers := make(map[string]*regexp.Regexp)
 			for _, p := range eligible {
-				compiled, err := regexp.Compile(patterns[p.id])
-				if err != nil {
-					return nil, fmt.Errorf("regexpset: candidate %d: %w", p.id, err)
+				source := patterns[p.id]
+				compiled := verifiers[source]
+				if compiled == nil {
+					var err error
+					compiled, err = regexp.Compile(source)
+					if err != nil {
+						return nil, fmt.Errorf("regexpset: candidate %d: %w", p.id, err)
+					}
+					verifiers[source] = compiled
 				}
 				result.exactPatterns[p.id] = compiled
 			}
@@ -251,31 +259,25 @@ func (s *Set) candidateMask(input string) uint64 {
 	return ^uint64(0)
 }
 func (s *Set) visitMatches(input string, emit func(int) bool) bool {
-	return s.visitWithMask(input, s.candidateMask(input), emit)
-}
-
-// visitWithMask streams distinct matching IDs. Sparse AC outputs are verified
-// directly by precompiled Go regexp; dense candidates use the shared DFA.
-// Candidate sets never enter DFA state identity, so cache entries stay valid.
-func (s *Set) visitWithMask(input string, mask uint64, emit func(int) bool) bool {
-	return s.visitWithCandidates(input, mask, nil, emit)
-}
-
-// visitWithCandidates accepts an optional already-scanned candidate snapshot,
-// so RuleSet priority decisions and verification share the same AC pass.
-func (s *Set) visitWithCandidates(input string, mask uint64, candidates *candidateScratch, emit func(int) bool) bool {
-	owned := false
-	useExact := false
-	if s.candidates != nil && !s.disableExact && mask != 0 {
+	if len(s.exactPatterns) > 0 {
+		candidates := s.candidates.candidatePatternsLimit(input, min(16, s.exactEligible/8))
 		if candidates == nil {
-			candidates = s.candidates.candidatePatterns(input)
-			owned = true
+			return s.visitWithCandidates(input, 0, nil, emit)
 		}
-		n := len(candidates.ids)
-		useExact = n > 0 && n <= 16 && n*8 <= s.exactEligible
-	}
-	if owned {
 		defer s.candidates.releaseCandidates(candidates)
+		return s.visitWithCandidates(input, candidates.groups, candidates, emit)
+	}
+	return s.visitWithCandidates(input, s.candidateMask(input), nil, emit)
+}
+
+// visitWithCandidates streams distinct pattern IDs using an already-scanned
+// snapshot. Sparse candidates use regexp verifiers; dense or absent snapshots
+// use the shared DFA. Candidate IDs never enter DFA state identity.
+func (s *Set) visitWithCandidates(input string, mask uint64, candidates *candidateScratch, emit func(int) bool) bool {
+	useExact := false
+	if len(s.exactPatterns) > 0 && candidates != nil {
+		n := len(candidates.ids)
+		useExact = candidates.complete && n > 0 && n <= 16 && n*8 <= s.exactEligible
 	}
 	for i, g := range s.groups {
 		if s.groupBits[i] != 0 && (mask&s.groupBits[i] == 0 || useExact) {
@@ -299,14 +301,17 @@ func (s *Set) visitWithCandidates(input string, mask uint64, candidates *candida
 func (s *Set) CacheStats() CacheStats {
 	var stats CacheStats
 	for _, g := range s.groups {
-		v := g.cacheStats()
-		stats.States += v.States
-		stats.Transitions += v.Transitions
-		stats.Bytes += v.Bytes
-		stats.UnicodeClasses += v.UnicodeClasses
-		stats.ASCIIClasses += v.ASCIIClasses
-		stats.Resets += v.Resets
-		stats.Evictions += v.Evictions
+		stats.add(g.cacheStats())
 	}
 	return stats
+}
+
+func (s *CacheStats) add(v CacheStats) {
+	s.States += v.States
+	s.Transitions += v.Transitions
+	s.Bytes += v.Bytes
+	s.UnicodeClasses += v.UnicodeClasses
+	s.ASCIIClasses += v.ASCIIClasses
+	s.Resets += v.Resets
+	s.Evictions += v.Evictions
 }

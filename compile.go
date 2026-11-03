@@ -66,6 +66,8 @@ func (m *machine) finish() {
 	m.finishSymbolicTrie()
 	m.buildASCIIClasses()
 	m.buildUnicodeClasses()
+	// Duplicate-program lookup is only needed while assembling the NFA.
+	m.compiled = nil
 	n, count := len(m.inst), m.count
 	m.pool = sync.Pool{New: func() any { return &scratch{seen: make([]uint32, n), matched: make([]bool, count)} }}
 }

@@ -51,7 +51,7 @@ type compiledFieldRule struct {
 type fieldMatcher struct {
 	name    string
 	set     *Set
-	leafIDs []int // indexes into FieldRuleSet's global leaf namespace
+	leafIDs []int // indexes into FieldRuleSet's shared predicate namespace
 }
 
 // FieldRuleSet compiles all regex leaves for each field into one Set, rather
@@ -60,16 +60,16 @@ type fieldMatcher struct {
 // for concurrent matching; a caller must not mutate fields concurrently.
 // Note that cache limits in Options currently apply PER DISTINCT FIELD.
 type FieldRuleSet struct {
-	rules  []compiledFieldRule
-	fields []fieldMatcher
-	leaves int
-	pool   sync.Pool
+	rules      []compiledFieldRule
+	fields     []fieldMatcher
+	leaves     int
+	predicates int
+	pool       sync.Pool
 }
 
 type fieldScratch struct {
 	fieldsSeen    []bool
 	leavesMatched []bool
-	matchedIDs    []int
 }
 
 // CompileFieldRules compiles nested AND/OR/NOT rules against named input fields.
@@ -84,6 +84,7 @@ func CompileFieldRulesWithOptions(rules []FieldRule, opts Options) (*FieldRuleSe
 	index := make(map[string]int)
 	seenRule := make(map[uint32]struct{}, len(rules))
 	patterns := make([][]string, 0)
+	predicateIDs := make([]map[string]int, 0)
 	var compile func(e Expr, loc string) (compiledExpr, error)
 	compile = func(e Expr, loc string) (compiledExpr, error) {
 		out := compiledExpr{op: e.Op}
@@ -98,12 +99,19 @@ func CompileFieldRulesWithOptions(rules []FieldRule, opts Options) (*FieldRuleSe
 				index[e.Field] = idx
 				s.fields = append(s.fields, fieldMatcher{name: e.Field})
 				patterns = append(patterns, nil)
+				predicateIDs = append(predicateIDs, make(map[string]int))
 			}
 			out.field = idx
-			out.leaf = s.leaves
 			s.leaves++
-			patterns[idx] = append(patterns[idx], e.Pattern)
-			s.fields[idx].leafIDs = append(s.fields[idx].leafIDs, out.leaf)
+			predicate, exists := predicateIDs[idx][e.Pattern]
+			if !exists {
+				predicate = s.predicates
+				s.predicates++
+				predicateIDs[idx][e.Pattern] = predicate
+				patterns[idx] = append(patterns[idx], e.Pattern)
+				s.fields[idx].leafIDs = append(s.fields[idx].leafIDs, predicate)
+			}
+			out.leaf = predicate
 		case ExprAnd, ExprOr, ExprNot:
 			if e.Field != "" || e.Pattern != "" {
 				return out, fmt.Errorf("regexpset: %s: logical node may not contain field or pattern", loc)
@@ -146,13 +154,25 @@ func CompileFieldRulesWithOptions(rules []FieldRule, opts Options) (*FieldRuleSe
 		s.fields[i].set = matcher
 	}
 	s.pool.New = func() any {
-		return &fieldScratch{fieldsSeen: make([]bool, len(s.fields)), leavesMatched: make([]bool, s.leaves)}
+		return &fieldScratch{fieldsSeen: make([]bool, len(s.fields)), leavesMatched: make([]bool, s.predicates)}
 	}
 	return s, nil
 }
 
-func (s *FieldRuleSet) Len() int          { return len(s.rules) }
+func (s *FieldRuleSet) Len() int { return len(s.rules) }
+
+// PatternCount counts original pattern leaves, including shared duplicates.
 func (s *FieldRuleSet) PatternCount() int { return s.leaves }
+
+// CacheStats sums the retained cache reservations across all fields. Options
+// budgets apply separately to each field, not to this aggregate.
+func (s *FieldRuleSet) CacheStats() CacheStats {
+	var stats CacheStats
+	for _, field := range s.fields {
+		stats.add(field.set.CacheStats())
+	}
+	return stats
+}
 
 // evaluate applies the compiled Boolean AST. Each existing field is scanned
 // no more than once per Match call, however many leaf conditions refer to it.
@@ -164,10 +184,11 @@ func (s *FieldRuleSet) evaluate(e *compiledExpr, fields map[string]string, sc *f
 			text, ok := fields[fm.name]
 			sc.fieldsSeen[e.field] = true
 			if ok {
-				sc.matchedIDs = fm.set.MatchInto(text, sc.matchedIDs[:0])
-				for _, id := range sc.matchedIDs {
+				// Boolean membership does not need a sorted intermediate ID list.
+				fm.set.visitMatches(text, func(id int) bool {
 					sc.leavesMatched[fm.leafIDs[id]] = true
-				}
+					return false
+				})
 			}
 		}
 		return sc.leavesMatched[e.leaf]
@@ -195,7 +216,6 @@ func (s *FieldRuleSet) getScratch() *fieldScratch { return s.pool.Get().(*fieldS
 func (s *FieldRuleSet) release(sc *fieldScratch) {
 	clear(sc.fieldsSeen)
 	clear(sc.leavesMatched)
-	sc.matchedIDs = sc.matchedIDs[:0]
 	s.pool.Put(sc)
 }
 

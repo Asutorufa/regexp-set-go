@@ -275,21 +275,24 @@ func (s *RuleSet) countMatches(sc *ruleScratch, input string) {
 // existence query we can stop on the first complete rule. For first-priority
 // matching, early exit is safe only when rule index zero is complete.
 func (s *RuleSet) countMatchesUntil(sc *ruleScratch, input string, stop func(int) bool) {
-	s.countMatchesWithMask(sc, input, s.set.candidateMask(input), stop)
+	s.set.visitMatches(input, func(patternID int) bool {
+		return s.recordMatch(sc, patternID, stop)
+	})
 }
 
-func (s *RuleSet) countMatchesWithMask(sc *ruleScratch, input string, candidates uint64, stop func(int) bool) {
-	s.countMatchesWithCandidates(sc, input, candidates, nil, stop)
-}
 func (s *RuleSet) countMatchesWithCandidates(sc *ruleScratch, input string, candidates uint64, exact *candidateScratch, stop func(int) bool) {
 	s.set.visitWithCandidates(input, candidates, exact, func(patternID int) bool {
-		index := s.patternToRule[patternID]
-		if sc.hits[index] == 0 {
-			sc.touched = append(sc.touched, index)
-		}
-		sc.hits[index]++
-		return stop != nil && stop(index)
+		return s.recordMatch(sc, patternID, stop)
 	})
+}
+
+func (s *RuleSet) recordMatch(sc *ruleScratch, patternID int, stop func(int) bool) bool {
+	index := s.patternToRule[patternID]
+	if sc.hits[index] == 0 {
+		sc.touched = append(sc.touched, index)
+	}
+	sc.hits[index]++
+	return stop != nil && stop(index)
 }
 
 func (s *RuleSet) release(sc *ruleScratch) {

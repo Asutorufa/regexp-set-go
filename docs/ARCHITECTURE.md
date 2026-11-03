@@ -1,7 +1,6 @@
 # RegexSet architecture (optimized version)
 
-This describes the **local optimization candidate** built on top of the
-public `regexp-set-go` engine; it retains Go `regexp.Regexp.MatchString`
+This describes the `regexp-set-go` engine; it retains Go `regexp.Regexp.MatchString`
 existence semantics and the original pattern ID for duplicate expressions.
 
 ## Compile pipeline
@@ -31,6 +30,10 @@ priority. It does not create one DFA per logical rule.
    Sparse candidate sets are checked using precompiled Go regexes; dense
    candidates use the shared DFA. Candidate sets never become DFA identities,
    avoiding input-dependent state explosion.
+   Ordinary Set and any/all RuleSet queries combine group-mask and exact-ID
+   discovery in one AC scan. Exact-ID collection stops once the sparse
+   verification threshold is exceeded, while the group mask still covers
+   the whole input. Priority proofs use an unbounded candidate snapshot.
 2. Each rune boundary implicitly starts new unanchored matches; start
    epsilon closures are cached by the exact `syntax.EmptyOp` boundary context.
    Anchored-prefix trie roots check their own beginning assertion.
@@ -46,7 +49,7 @@ priority. It does not create one DFA per logical rule.
    publish separately allocated deep copies with no aliases into scratch.
 7. A cache generation switch never mutates old states held by concurrent
    readers. With optional per-state LRU, eviction removes a victim's intern
-   entry and inbound edges under a generation-wide eviction lock; readers
+   entry, slot and outgoing edges under a generation-wide eviction lock; readers
    holding a temporary pointer can finish safely without resurrecting the
    evicted state. Intern shards, per-state locks and atomic budgets are
    synchronized.
@@ -54,6 +57,11 @@ priority. It does not create one DFA per logical rule.
    defeat unresolved higher-priority AND rules. AC **per-pattern** necessary
    literals can prove a higher-priority rule impossible, allowing safe early
    returns without declaring a false regex match.
+9. FieldRuleSet shares identical `(field, pattern)` Boolean predicates across
+   expression leaves. Original leaf counts and rule IDs remain unchanged;
+   field evaluation marks membership directly without sorting an ID list.
+   Standalone Set and flat RuleSet retain every original pattern identity,
+   including repeated AND requirements.
 
 ## Complexity and tradeoffs
 
@@ -67,12 +75,17 @@ state-count and an **estimated byte reservation** budget bound retained
 accounted cache entries but **not** RSS or complete Go heap use. Compiled
 programs, AC tries, scratch pools, old GC generations and map overhead are
 outside the budget. Optional `EvictLRU` chooses the oldest approximately
-observed state, deletes its inbound cached transitions, and permits admission
-of a replacement. This is a potentially expensive O(number of retained states)
-scan per eviction, **not** a constant-time LRU. Whole-generation reset is a
+observed state and unlinks it in expected O(1) map/list work. Incoming edges
+hold revocable slot IDs and become cache misses when their target is evicted;
+they do not keep the victim alive. Stale edges still consume reservations
+until replaced or their source is evicted. Whole-generation reset is a
 separate, opt-in alternative. Neither policy enforces Go heap/RSS limits.
 
-Remaining limits: exact byte-level Go heap allocation control, O(1) eviction,
-generic arbitrary-prefix automaton factoring and complete Unicode
-casefolding-aware classes. Per-pattern verification duplicates some compiled
-regular-expression memory outside the DFA budget. See `OPTIMIZATIONS.md`.
+Remaining limits include exact byte-level Go heap allocation control and
+generic arbitrary-language minimization. Exact Unicode equivalence classes
+are computed eagerly for manageable programs and lazily for large programs.
+Per-pattern verification duplicates some compiled regular-expression memory
+outside the DFA budget. Identical verifier sources share one regexp object;
+sets with fewer than eight eligible patterns omit the unreachable verifier
+path. Compile-only duplicate-program lookup is released after NFA assembly.
+See `OPTIMIZATIONS.md`.
