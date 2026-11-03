@@ -84,9 +84,10 @@ type prefilter struct {
 	oneRoot      bool
 }
 type candidateScratch struct {
-	groups uint64
-	seen   []bool
-	ids    []int
+	groups   uint64
+	seen     []bool
+	ids      []int
+	complete bool // false when a bounded scan found too many distinct IDs
 }
 type acNode struct {
 	next       map[byte]int
@@ -166,10 +167,10 @@ func newPrefilterPatterns(literals []string, groups, patterns []int, patternCoun
 	return f
 }
 
-// rejectsAtRoot uses SIMD for a necessary first byte common to all literals.
-// Small inputs skip the preliminary scan to avoid paying for two passes.
+// rejectsAtRoot uses the architecture-optimized byte search for a necessary
+// first byte common to all literals, including short hostname inputs.
 func (f *prefilter) rejectsAtRoot(input string) bool {
-	return f.oneRoot && len(input) >= 64 && !fastContainsByte(input, f.rootByte)
+	return f.oneRoot && !fastContainsByte(input, f.rootByte)
 }
 
 func (f *prefilter) candidateGroups(input string) uint64 {
@@ -202,12 +203,20 @@ func (f *prefilter) containsAny(input string) bool {
 // candidatePatterns collects exact *necessary* regex candidates. A candidate
 // still needs regex verification. The caller must release the scratch.
 func (f *prefilter) candidatePatterns(input string) *candidateScratch {
-	sc := f.pool.Get().(*candidateScratch)
-	sc.ids = sc.ids[:0]
-	sc.groups = 0
-	if f.rejectsAtRoot(input) {
+	if sc := f.candidatePatternsLimit(input, 0); sc != nil {
 		return sc
 	}
+	return f.getCandidates()
+}
+
+// candidatePatternsLimit always scans the full group mask, but stops collecting
+// IDs after limit distinct candidates. Zero collects all IDs for priority proofs.
+// It returns nil when no group qualifies, avoiding pool work on negative input.
+func (f *prefilter) candidatePatternsLimit(input string, limit int) *candidateScratch {
+	if f.rejectsAtRoot(input) {
+		return nil
+	}
+	var sc *candidateScratch
 	at := 0
 	for i := 0; i < len(input); i++ {
 		ch := input[i]
@@ -221,18 +230,43 @@ func (f *prefilter) candidatePatterns(input string) *candidateScratch {
 		} else {
 			at = 0
 		}
+		if f.nodes[at].output == 0 {
+			continue
+		}
+		if sc == nil {
+			sc = f.getCandidates()
+		}
 		sc.groups |= f.nodes[at].output
+		if !sc.complete {
+			continue
+		}
 		for n := at; n != 0; n = f.nodes[n].outputLink {
 			for _, id := range f.nodes[n].ids {
 				if !sc.seen[id] {
+					if limit > 0 && len(sc.ids) == limit {
+						sc.complete = false
+						break
+					}
 					sc.seen[id] = true
 					sc.ids = append(sc.ids, id)
 				}
+			}
+			if !sc.complete {
+				break
 			}
 		}
 	}
 	return sc
 }
+
+func (f *prefilter) getCandidates() *candidateScratch {
+	sc := f.pool.Get().(*candidateScratch)
+	sc.ids = sc.ids[:0]
+	sc.groups = 0
+	sc.complete = true
+	return sc
+}
+
 func (f *prefilter) releaseCandidates(sc *candidateScratch) {
 	for _, id := range sc.ids {
 		sc.seen[id] = false

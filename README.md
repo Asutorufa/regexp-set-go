@@ -163,6 +163,9 @@ with `go test -run '^$' -bench ... -benchmem`:
 | `BenchmarkExactCandidates` | Sparse candidate verification vs full shared DFA, miss and hit |
 | `BenchmarkEvictLRU` | Opt-in per-state LRU versus correct uncached fallback |
 | `BenchmarkCompile` | Parsing and automaton construction time |
+| `BenchmarkCompileCandidateModes` | Small/1k/10k compilation with and without exact verifiers |
+| `BenchmarkDuplicateFields` | Repeated field predicates with an early winning rule |
+| `BenchmarkDenseCandidates`, `BenchmarkShortPrefilter` | Dense candidate fallback and short-input root rejection |
 | `BenchmarkSIMDNeedle`, `BenchmarkACRootByteVectorReject`, `BenchmarkSSE2Kernel` | Vectorized first-byte filtering against direct AC and standalone SSE2 |
 
 
@@ -197,6 +200,10 @@ magnitude slower than warmed cache. Benchmark *your* rules and inputs with
 `DisablePrefilter` and `DisableCandidateShards` toggles. These figures are
 short-run exploratory numbers; they should not be used as cross-machine ratios.
 [Benchmark methodology](docs/BENCHMARKS.md) lists reproducibility caveats.
+
+The [candidate-scan and field-predicate measurements](docs/PERFORMANCE_2026-11-03.md)
+compare the same fixtures before and after optimization, including negative
+traffic and compilation counterexamples.
 
 ## Validation and limitations
 

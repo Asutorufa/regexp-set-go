@@ -50,9 +50,10 @@ func BenchmarkCacheBudget(b *testing.B) {
 		label string
 		opts  Options
 	}{
-		{"default", Options{}},
-		{"tiny-fallback", Options{MaxStates: 4, MaxTransitions: 8}},
-		{"tiny-reset", Options{MaxStates: 4, MaxTransitions: 8, ResetCacheOnFull: true}},
+		{"exact-default", Options{}},
+		{"dfa-default", Options{DisableExactCandidates: true}},
+		{"tiny-fallback", Options{DisableExactCandidates: true, MaxStates: 4, MaxTransitions: 8}},
+		{"tiny-reset", Options{DisableExactCandidates: true, MaxStates: 4, MaxTransitions: 8, ResetCacheOnFull: true}},
 	}
 	for _, tc := range cases {
 		s, err := CompileWithOptions(rules, tc.opts)
@@ -61,6 +62,9 @@ func BenchmarkCacheBudget(b *testing.B) {
 		}
 		for _, str := range inputs {
 			s.MatchAny(str)
+		}
+		if tc.opts.DisableExactCandidates && s.CacheStats().States == 0 {
+			b.Fatal("cache-pressure fixture did not populate the DFA cache")
 		}
 		b.Run(tc.label, func(b *testing.B) {
 			b.ReportAllocs()

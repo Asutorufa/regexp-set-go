@@ -76,8 +76,14 @@ ids := set.MatchRuleIDs(fields)     // []uint32{100}
   is evaluated lazily the first time a visited expression refers to it, and
   its regex matching results are reused by later expressions in that query.
   `MatchFirstRule` short-circuits in rule-priority and expression order.
+  Identical patterns on the same field share one Boolean predicate, while
+  `PatternCount()` still reports the original number of pattern leaves.
+  Matching marks predicate membership directly without sorting intermediate
+  pattern IDs. The first access to a field still evaluates its full Set.
 - The engine's cache budgets (`Options`) apply **per field**, not across all
   fields in the `FieldRuleSet`. Large field sets require separate memory plans.
+  `CacheStats()` aggregates retained cache reservations across all fields;
+  it does not report complete heap or RSS usage.
 - `FieldRuleSet` is safe for concurrent matching. The caller must not mutate
   its input field map during a match. Logical rule actions are application
   responsibilities.
@@ -106,15 +112,16 @@ split points (including invalid UTF-8) and field-tree results against Go's
 standard `regexp` engine. Streaming benchmarks report per-chunk overhead,
 not guaranteed throughput advantages. Always test real rule distributions.
 
-## LRU cache maintenance (partial optimization)
+## LRU cache maintenance
 
 With `EvictLRU: true`, states now occupy an intrusive-style ordering list:
 `touch` moves a cached state to the front and `evictOne` selects the tail,
 each **O(1)** with respect to state count. All linked-list operations are
 synchronized, and the policy is opt-in since touching each hot state takes a
-lock. **Complete eviction is not O(1)**: the engine still walks retained
-states to delete cached incoming edges and adjusts tracked byte/edge budgets.
-Getting truly constant-time complete eviction requires redesigning edge
-ownership or introducing a safe lazy-invalidation scheme that does not retain
-unbounded stale pointers. Existing cache budgets are accounting estimates,
-not exact Go heap limits.
+lock. Cached incoming transitions hold revocable state IDs. Eviction unlinks
+the victim's intern entry and ID, then detaches its outgoing transitions in
+expected O(1) map/list work; it does not scan incoming edges. Expired handles
+are resolved as cache misses, and stale edges retain their reservations until
+reused or their source is evicted. Garbage collection and Go hash-map worst
+cases are outside this expected-cost model. Existing cache budgets are
+accounting estimates, not exact Go heap limits.
